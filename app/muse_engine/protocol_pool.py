@@ -148,12 +148,12 @@ class AccountNoiseWorker:
                             ctx = payload.get("chat_context") or {}
                             if isinstance(ctx, dict):
                                 device = ctx.get("device_id")
-                        # Broadcast: targeted listeners get their device events;
-                        # also deliver presentation-like events without device to all
-                        # active listeners (they apply their own filters).
+                        # Deliver device-targeted events strictly to that listener (dropping
+                        # stale/foreign device_ids from subscribe replay or other runs);
+                        # only device-less events broadcast to active listeners.
                         targets: list[TaskListener]
-                        if device and device in self.listeners:
-                            targets = [self.listeners[device]]
+                        if device:
+                            targets = [self.listeners[device]] if device in self.listeners else []
                         else:
                             targets = list(self.listeners.values())
                         for listener in targets:

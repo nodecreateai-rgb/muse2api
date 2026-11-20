@@ -201,6 +201,67 @@ def _payload_device_id(payload: dict) -> str | None:
     return None
 
 
+def _scoped_transcript_messages(
+    transcript: Any,
+    *,
+    node_id: str,
+    marker: str | None,
+) -> list[dict[str, Any]]:
+    """Return transcript messages strictly belonging to the active turn."""
+    if not isinstance(transcript, dict):
+        return []
+    messages = transcript.get("messages")
+    if not isinstance(messages, list):
+        return []
+
+    turn_start: int | None = None
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        m_dev = _payload_device_id(msg)
+        m_meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+        m_marker = m_meta.get("client_marker")
+        if (m_dev and m_dev == node_id) or (marker and m_marker == marker):
+            if msg.get("role") == "user" or turn_start is None:
+                turn_start = idx
+    if turn_start is None:
+        return []
+
+    scoped: list[dict[str, Any]] = []
+    for msg in messages[turn_start:]:
+        if not isinstance(msg, dict):
+            continue
+        m_dev = _payload_device_id(msg)
+        if m_dev and m_dev != node_id:
+            if msg.get("role") == "user":
+                break
+            continue
+        scoped.append(msg)
+    return scoped
+
+
+def _scoped_media_candidates(
+    event_name: str,
+    payload: dict[str, Any],
+    *,
+    node_id: str,
+    marker: str | None,
+    output: list[dict],
+) -> None:
+    """Collect media candidates for this task without pulling older transcript turns."""
+    if event_name != "delta.message_done":
+        _media_candidates(payload, output)
+        return
+
+    trimmed = {k: v for k, v in payload.items() if k != "transcript"}
+    _media_candidates(trimmed, output)
+
+    for msg in _scoped_transcript_messages(
+        payload.get("transcript"), node_id=node_id, marker=marker
+    ):
+        _media_candidates(msg, output)
+
+
 class ProtocolEngine:
     """Noise + chat.stream; start() deliberately never launches Chromium."""
 
@@ -331,6 +392,19 @@ class ProtocolEngine:
             body = {"items": items, "node_id": node_id, "capabilities": {}}
             if marker:
                 body["metadata"] = {"client_marker": marker}
+            scan_offset = 0
+            if pooled and listener is not None:
+                local_sub_id = None
+                while True:
+                    try:
+                        listener.queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+            elif not pooled and local_sub_id is not None:
+                raw_pre = bytes(client.responses[local_sub_id].body)
+                pre_complete = raw_pre.rfind(b"\n")
+                if pre_complete >= 0:
+                    scan_offset = pre_complete + 1
             log(f"提交 chat.stream（参考素材 {len(references)} 个）")
             note("stream_send_start", node_id=node_id, marker=marker)
             sent = await client.request("POST", "/chat/stream", body, 60)
@@ -357,9 +431,6 @@ class ProtocolEngine:
             done: dict | None = None
             done_at: float | None = None
             presentation_ready = False
-            scan_offset = 0
-            if pooled:
-                local_sub_id = None
 
             while time.monotonic() < deadline:
                 events = []
@@ -407,6 +478,8 @@ class ProtocolEngine:
                     if name == "res" or not isinstance(payload, dict):
                         continue
                     device_id = _payload_device_id(payload)
+                    if device_id and device_id != node_id:
+                        continue
                     ours = device_id == node_id
                     if name == "delta.text_append":
                         if not ours:
@@ -426,7 +499,13 @@ class ProtocolEngine:
                         "delta.placeholder",
                     ):
                         before = len(candidates)
-                        _media_candidates(payload, candidates)
+                        _scoped_media_candidates(
+                            name,
+                            payload,
+                            node_id=node_id,
+                            marker=marker,
+                            output=candidates,
+                        )
                         if name == "delta.presentation" and len(candidates) > before:
                             presentation_ready = True
                             if "first_event" not in client.timings:
@@ -453,11 +532,14 @@ class ProtocolEngine:
                 if done is not None and expect is None:
                     text = "".join(text_parts)
                     if not text:
-                        transcript = done.get("transcript") or {}
                         content = []
-                        for message in transcript.get("messages") or []:
+                        for message in _scoped_transcript_messages(
+                            done.get("transcript"), node_id=node_id, marker=marker
+                        ):
+                            if message.get("role") == "user":
+                                continue
                             for part in message.get("content") or []:
-                                if part.get("type") == "text":
+                                if isinstance(part, dict) and part.get("type") == "text":
                                     content.append(str(part.get("text") or ""))
                         text = "".join(content)
                     client._mark("generation_done")

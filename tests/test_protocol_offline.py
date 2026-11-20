@@ -385,3 +385,198 @@ class MediaHostTests(unittest.TestCase):
         self.assertEqual(r_img.headers["content-type"], "image/png")
         self.assertEqual(r_vid.status_code, 200)
         self.assertEqual(r_vid.headers["content-type"], "video/mp4")
+
+
+class StreamIsolationTests(unittest.TestCase):
+    def test_pooled_dispatch_drops_foreign_device_events_and_stream_ignores_replay(self):
+        import asyncio
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from app.muse_engine.config import EngineConfig
+        from app.muse_engine.protocol_engine import ProtocolEngine, _scoped_media_candidates
+        from app.muse_engine.protocol_pool import AccountNoiseWorker
+
+        # 1) _scoped_media_candidates skips older turns in delta.message_done transcript
+        done_payload = {
+            "chat_context": {"device_id": "node-new"},
+            "transcript": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "chat_context": {"device_id": "node-old"},
+                        "content": [{"type": "text", "text": "old bird"}],
+                    },
+                    {
+                        "role": "assistant",
+                        "chat_context": {"device_id": "node-old"},
+                        "path": "sandbox://workspace/imagine_media/old_bird.webp",
+                    },
+                    {
+                        "role": "user",
+                        "chat_context": {"device_id": "node-new"},
+                        "content": [{"type": "text", "text": "new star"}],
+                    },
+                    {
+                        "role": "assistant",
+                        "chat_context": {"device_id": "node-new"},
+                        "path": "sandbox://workspace/imagine_media/new_star.webp",
+                    },
+                ]
+            },
+        }
+        scoped: list[dict] = []
+        _scoped_media_candidates(
+            "delta.message_done",
+            done_payload,
+            node_id="node-new",
+            marker=None,
+            output=scoped,
+        )
+        self.assertEqual(
+            [c["resource"]["path"] for c in scoped],
+            ["sandbox://workspace/imagine_media/new_star.webp"],
+        )
+
+        # 2) Unpooled _stream ignores replayed historical events from foreign device_id
+        class FakeClient:
+            def __init__(self):
+                self.node_id = "node-new"
+                self.timings = {}
+                self.responses = {
+                    1: SimpleNamespace(
+                        body=bytearray(
+                            (
+                                json.dumps(
+                                    {
+                                        "event": "delta.presentation",
+                                        "seq": 5,
+                                        "payload": {
+                                            "chat_context": {"device_id": "node-old"},
+                                            "data": {
+                                                "images": [
+                                                    {
+                                                        "path": "sandbox://workspace/imagine_media/old_bird.webp",
+                                                        "mime": "image/webp",
+                                                    }
+                                                ]
+                                            },
+                                        },
+                                    }
+                                )
+                                + "\n"
+                            ).encode()
+                        )
+                    )
+                }
+                self.downloaded: list[str] = []
+
+            def _mark(self, name):
+                self.timings[name] = 1.0
+
+            async def connect(self):
+                return None
+
+            async def subscribe(self):
+                return 1, {"status": "ok", "payload": {"capabilities": []}}
+
+            async def request(self, method, path, body, timeout):
+                # Append the live event for node-new only after chat.stream is sent
+                self.responses[1].body.extend(
+                    (
+                        json.dumps(
+                            {
+                                "event": "delta.presentation",
+                                "seq": 16,
+                                "payload": {
+                                    "chat_context": {"device_id": "node-new"},
+                                    "data": {
+                                        "images": [
+                                            {
+                                                "path": "sandbox://workspace/imagine_media/new_star.webp",
+                                                "mime": "image/webp",
+                                            }
+                                        ]
+                                    },
+                                },
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                return SimpleNamespace(status=200, json=lambda: {"message_id": "m2", "session_id": "s1"})
+
+            async def wait_update(self, sub_id, timeout):
+                await asyncio.sleep(0.01)
+
+            async def download_bytes(self, resource):
+                self.downloaded.append(resource["path"])
+                return b"new-star-bytes"
+
+            async def close(self):
+                return None
+
+        fake = FakeClient()
+        eng = ProtocolEngine(EngineConfig())
+
+        async def run_stream():
+            events = []
+            async for ev in eng._stream(
+                {"hatch_sess": "h"},
+                "draw star",
+                expect="image",
+                timeout=10,
+                reference_images=None,
+                proxy=None,
+                use_pool=False,
+            ):
+                events.append(ev)
+            return events
+
+        with patch("app.muse_engine.protocol_engine.HatchProtocolClient", return_value=fake):
+            out = asyncio.run(run_stream())
+        self.assertEqual(fake.downloaded, ["sandbox://workspace/imagine_media/new_star.webp"])
+        self.assertEqual(out[-1]["data"], b"new-star-bytes")
+
+        # 3) Pooled _dispatch_loop must not deliver foreign device_id to active listeners
+        worker = AccountNoiseWorker("test-acc-isolation")
+        try:
+            async def test_pool_dispatch():
+                listener = await worker.register_listener("node-new")
+                foreign = json.dumps(
+                    {
+                        "event": "delta.presentation",
+                        "seq": 5,
+                        "payload": {"chat_context": {"device_id": "node-old"}},
+                    }
+                )
+                mine = json.dumps(
+                    {
+                        "event": "delta.presentation",
+                        "seq": 16,
+                        "payload": {"chat_context": {"device_id": "node-new"}},
+                    }
+                )
+                worker.client = SimpleNamespace(
+                    responses={1: SimpleNamespace(body=bytearray((foreign + "\n" + mine + "\n").encode()))},
+                    wait_update=lambda *a, **kw: asyncio.sleep(0.05),
+                )
+                worker.subscription_id = 1
+                task = asyncio.create_task(worker._dispatch_loop())
+                await asyncio.sleep(0.05)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                got = []
+                while not listener.queue.empty():
+                    got.append(listener.queue.get_nowait())
+                return [e["seq"] for e in got]
+
+            seqs = worker.call(test_pool_dispatch(), timeout=5)
+            self.assertEqual(seqs, [16])
+        finally:
+            worker.client = None
+            worker.shutdown()
