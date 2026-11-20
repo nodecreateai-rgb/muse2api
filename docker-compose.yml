@@ -31,7 +31,7 @@ services:
       SIGNUP_MUSE_BASE: ${SIGNUP_MUSE_BASE:-https://muse.ai}
       CHECKOUT_ENABLED: ${CHECKOUT_ENABLED:-true}
       MAX_CONCURRENCY: ${MAX_CONCURRENCY:-8}
-      MEDIA_AUTH_REQUIRED: ${MEDIA_AUTH_REQUIRED:-true}
+      MEDIA_AUTH_REQUIRED: ${MEDIA_AUTH_REQUIRED:-false}
       REWRITE_MEDIA_URLS: ${REWRITE_MEDIA_URLS:-true}
     volumes:
       # SQLite database (accounts, cards, settings, logs) + generated media files.

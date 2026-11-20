@@ -352,3 +352,36 @@ class MediaHostTests(unittest.TestCase):
             base_url="https://muse.example.com",
         )
         self.assertEqual(rewritten, "https://muse.example.com/v1/media/demo.png")
+
+    def test_media_public_access_without_auth_by_default(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from app.config import Settings
+        from app.routers.v1 import router as v1_router
+
+        self.assertFalse(Settings(_env_file=None).media_auth_required)
+        mini_app = FastAPI()
+        mini_app.include_router(v1_router)
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / "demo.png"
+            vid = Path(td) / "demo.mp4"
+            img.write_bytes(PNG_MAGIC + b"demo")
+            vid.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+            public_cfg = Settings(_env_file=None, media_auth_required=False)
+            with (
+                patch("app.routers.v1.get_settings", return_value=public_cfg),
+                patch(
+                    "app.muse_engine.service.media_path",
+                    side_effect=lambda name: str(Path(td) / name),
+                ),
+            ):
+                client = TestClient(mini_app)
+                r_img = client.get("/v1/media/demo.png")
+                r_vid = client.get("/v1/media/demo.mp4")
+        self.assertEqual(r_img.status_code, 200)
+        self.assertEqual(r_img.headers["content-type"], "image/png")
+        self.assertEqual(r_vid.status_code, 200)
+        self.assertEqual(r_vid.headers["content-type"], "video/mp4")

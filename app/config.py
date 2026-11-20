@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     stream_idle_timeout_sec: float = 120
     max_concurrency: int = 8
 
-    media_auth_required: bool = True
+    media_auth_required: bool = False
     rewrite_media_urls: bool = True
     # Alias GENERATE_PLAYGROUND / generate_playground (settings API later)
     console_generate_enabled: bool = Field(

@@ -117,7 +117,7 @@ curl -sS -X POST http://127.0.0.1:8090/v1/videos \
 # 查询：GET /v1/videos/{id}
 ```
 
-媒体地址默认改写到 `PUBLIC_BASE/v1/media/{name}`。`MEDIA_AUTH_REQUIRED=true` 时，下载该地址需要 Bearer；管理台里已登录的浏览器可以用会话 Cookie 直接看图和播放视频。
+媒体地址默认改写到 `PUBLIC_BASE/v1/media/{name}`。默认 `MEDIA_AUTH_REQUIRED=false`（图片、视频等资源链接可直接打开访问）；设为 `true` 时下载需要 Bearer 或管理台会话 Cookie。
 
 调用会写入 `call_logs`：时间、路径、模型、状态、耗时、错误摘要、Key 前缀。不保存完整密钥，也不保存图片的 base64。
 
@@ -201,7 +201,7 @@ curl -b cj -X POST http://127.0.0.1:8090/api/cards/import \
 | `SIGNUP_MAIL_WAIT_SEC` | `90` | 等待验证码或恢复码的最长时间 |
 | `MAX_CONCURRENCY` | `8` | 对外生成并发上限 |
 | `REWRITE_MEDIA_URLS` | `true` | 把媒体地址改写到本网关 |
-| `MEDIA_AUTH_REQUIRED` | `true` | 媒体下载是否要求 Key |
+| `MEDIA_AUTH_REQUIRED` | `false` | 媒体下载是否要求 Key |
 | `CONSOLE_GENERATE_ENABLED` | `true` | 是否允许管理台试调 |
 | `RECORD_KEEP_DAYS` | `30` | 调用记录保留天数 |
 
