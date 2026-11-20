@@ -162,10 +162,18 @@ async def batch_subs(body: BatchBody, request: Request):
                 csrf_meta_enc=None,
             )
         elif body.action == "retry":
-            if item.get("status") in ("failed", "stopped"):
-                patch["status"] = "pending"
-                patch["message"] = "重试排队"
-                patch["last_error"] = None
+            if item.get("status") in ("failed", "stopped", "geo_gated"):
+                has_sess = bool(
+                    item.get("cookie_blob")
+                    or (store.get_session_meta(iid) or {}).get("hatch_sess")
+                )
+                if item.get("status") == "geo_gated" and has_sess:
+                    patch["message"] = "更换代理重试排队"
+                    patch["last_error"] = None
+                else:
+                    patch["status"] = "pending"
+                    patch["message"] = "重试排队"
+                    patch["last_error"] = None
         if patch:
             store.update_item(iid, **patch)
 
@@ -180,6 +188,8 @@ async def batch_subs(body: BatchBody, request: Request):
                 continue
             if item.get("status") == "failed":
                 store.update_item(iid, status="pending", last_error=None, message="重试")
+            elif item.get("status") == "geo_gated":
+                store.update_item(iid, last_error=None, message="更换代理重试")
             run_ids.append(iid)
         started = runner.start_batch(run_ids)
         return {"ok": True, "action": body.action, "queued": len(run_ids), **started}

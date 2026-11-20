@@ -28,6 +28,7 @@ from app.signup.identity import (
 from app.signup.protocol import (
     MuseSession,
     MuseProtocolError,
+    fresh_sticky_proxy,
     get_muse_client,
     mask_proxy_url,
     pick_proxy,
@@ -115,24 +116,77 @@ def _log(item_id: str, msg: str, level: str = "info") -> None:
     logger.info("[%s] %s", item_id, msg)
 
 
-def _bind_session_proxy(item: dict[str, Any], sess: MuseSession) -> str:
-    """Attach a fresh proxy exit to the session; return masked label for logs.
+MAX_GEO_PROXY_RETRIES = 6
 
-    When the configured proxy is a provider template with `{sid}` we always
-    expand it again (new sticky session) instead of reusing the stored, possibly
-    throttled, expanded URL — arxlabs closes a sid after heavy use.
+
+def _is_geo_blocked_error(exc: MuseProtocolError) -> bool:
+    """Return True when Muse rejected this exit IP due to geo-gate / 403 block."""
+    msg = (exc.message or "").lower()
+    detail_text = json.dumps(exc.detail, ensure_ascii=False, default=str).lower() if exc.detail else ""
+    blob = f"{msg} {detail_text}"
+    if "csrf" in blob:
+        return False
+    if msg == "bootstrap_blocked" or exc.status_code == 403:
+        return True
+    return any(
+        kw in blob
+        for kw in (
+            "geo_gated",
+            "isgeogated",
+            "geo-gate",
+            "region",
+            "waitlist",
+            "content isn't available",
+            "not available in your",
+            "unsupported country",
+        )
+    )
+
+
+def _bind_session_proxy(
+    item: dict[str, Any],
+    sess: MuseSession,
+    *,
+    force_rotate: bool = False,
+    exclude: set[str] | None = None,
+) -> str:
+    """Attach a proxy exit to the session; return masked label for logs.
+
+    When `force_rotate=True` (or the configured proxy is a `{sid}` template),
+    pick a fresh exit that is not in `exclude`.
     """
     from app.signup.protocol import expand_proxy_sid
 
     settings = get_settings()
     pool_raw = getattr(settings, "proxies", "") or ""
-    preferred = (item.get("proxy") or sess.proxy_url or "").strip() or None
-    if "{sid}" in pool_raw and (not preferred or "-sid-" in preferred or "arxlabs" in preferred):
-        chosen = expand_proxy_sid(pick_proxy(pool_raw) or "")
+    ex = set(exclude or ()) - {""}
+    cur = (sess.proxy_url or "").strip()
+    if force_rotate and cur:
+        ex.add(cur)
+
+    explicit = (item.get("proxy") or "").strip() or None
+    preferred = explicit if explicit else (None if force_rotate else (cur or None))
+    if "{sid}" in pool_raw and (
+        force_rotate or not preferred or "-sid-" in preferred or "arxlabs" in preferred
+    ):
+        chosen = expand_proxy_sid(pick_proxy(pool_raw, exclude=ex) or "")
     else:
-        chosen = expand_proxy_sid(pick_proxy(pool_raw, preferred=preferred) or "")
+        chosen = expand_proxy_sid(pick_proxy(pool_raw, preferred=preferred, exclude=ex) or "")
     sess.proxy_url = chosen or ""
     return mask_proxy_url(sess.proxy_url) or "(direct)"
+
+
+def _rotate_session_proxy(sess: MuseSession, tried: set[str]) -> str | None:
+    """Switch `sess.proxy_url` to an untried proxy from settings.proxies; return masked label or None."""
+    cur = (sess.proxy_url or "").strip()
+    if cur:
+        tried.add(cur)
+    new_proxy = fresh_sticky_proxy(exclude=tried)
+    if not new_proxy or new_proxy in tried:
+        return None
+    sess.proxy_url = new_proxy
+    tried.add(new_proxy)
+    return mask_proxy_url(new_proxy) or "(proxy)"
 
 
 def _mask_code(code: str) -> str:
@@ -688,69 +742,129 @@ async def _after_session(
     into_pool: bool,
     email: str,
     skip_payment_if_activated: bool = False,
+    force_rotate_proxy: bool = False,
+    exclude: set[str] | None = None,
 ) -> dict[str, Any]:
     """bootstrap →  年龄验证（卡池自动取卡填协议） → accept-tos → 设密 → 入池.
 
     Only accounts the server flags as `ccvStatus: not_required` skip the card
     step (checkout/init 403); everything else pulls a card from the pool and
-    fills the checkout protocol (PTT JWE → credential → finalize).
+    fills the checkout protocol (PTT JWE → credential → finalize). If an IP is
+    geo-gated (403), automatically rotate to a fresh proxy from the pool and
+    retry before marking the item `geo_gated`.
     """
     item = store.get_item(item_id) or {}
-    _bind_session_proxy(item, sess)
-    client = get_muse_client(proxy=sess.proxy_url or None)
-    await client.bootstrap(sess)
-    if skip_payment_if_activated and sess.already_activated:
-        _log(item_id, "已激活账号，跳过 checkout")
-        return await _finish_activation(item_id, sess, into_pool, email)
-    store.save_session_meta(item_id, _meta_from_sess(sess))
+    tried_proxies: set[str] = set(exclude or ()) - {""}
+    if sess.proxy_url:
+        tried_proxies.add(sess.proxy_url)
+    proxy_label = _bind_session_proxy(
+        item,
+        sess,
+        force_rotate=force_rotate_proxy,
+        exclude=tried_proxies if force_rotate_proxy else None,
+    )
+    if force_rotate_proxy and sess.proxy_url:
+        _log(item_id, f"切换新代理继续：proxy={proxy_label}")
+    if sess.proxy_url:
+        tried_proxies.add(sess.proxy_url)
+
     settings = get_settings()
+    last_geo_exc: MuseProtocolError | None = None
 
-    if bool(getattr(settings, "checkout_enabled", False)):
-        paid = await _pay_with_card(
-            item_id, sess, into_pool, email, allow_fallback=True
-        )
-        if paid is not None:
-            return paid
-    else:
-        store.update_item(
-            item_id,
-            status="awaiting_external_payment",
-            message="等待外部支付（提交 payment_ref 后 resume）",
-            cookie_preview=_preview(_cookie_header(sess)) if sess.hatch_sess else None,
-            cookie_blob=_cookie_header(sess) if sess.hatch_sess else None,
-        )
-        _log(item_id, "到达 awaiting_external_payment（checkout 已关闭）")
-        return {"ok": True, "status": "awaiting_external_payment", "needs": ["payment_external"]}
+    for geo_round in range(1, MAX_GEO_PROXY_RETRIES + 1):
+        if stopped():
+            store.update_item(item_id, status="stopped", message="已停止")
+            return {"ok": True, "status": "stopped"}
 
-    # fallback: checkout refused this account (usually not admitted yet).
-    # Spend one code from a successful account, then accept the terms.
-    tos_ok = False
-    last_exc: MuseProtocolError | None = None
-    for attempt in (1, 2):
-        if attempt == 2 and (sess.checkout or {}).get("invite_redeemed"):
-            break
-        await _redeem_library_invite(item_id, sess, client)
-        try:
-            await client.accept_tos(sess)
-            _log(item_id, "accept-tos OK（该账号无需卡验证）")
-            tos_ok = True
-            break
-        except MuseProtocolError as exc:
-            last_exc = exc
-            if (sess.checkout or {}).get("invite_redeemed"):
+        client = get_muse_client(proxy=sess.proxy_url or None)
+        if geo_round == 1 or not sess.hatch_sess:
+            try:
+                await client.bootstrap(sess)
+            except MuseProtocolError as exc:
+                if _is_geo_blocked_error(exc) and geo_round < MAX_GEO_PROXY_RETRIES:
+                    next_label = _rotate_session_proxy(sess, tried_proxies)
+                    if next_label:
+                        store.save_session_meta(item_id, _meta_from_sess(sess))
+                        _log(
+                            item_id,
+                            f"bootstrap 遇到地区受限 / {exc.status_code}，换代理重试（第 {geo_round + 1}/{MAX_GEO_PROXY_RETRIES} 次 · proxy={next_label}）",
+                            "warn",
+                        )
+                        await asyncio.sleep(1.0)
+                        continue
+                if _is_geo_blocked_error(exc):
+                    last_geo_exc = exc
+                    break
+                raise
+
+        if skip_payment_if_activated and sess.already_activated:
+            _log(item_id, "已激活账号，跳过 checkout")
+            return await _finish_activation(item_id, sess, into_pool, email)
+        store.save_session_meta(item_id, _meta_from_sess(sess))
+
+        if bool(getattr(settings, "checkout_enabled", False)):
+            paid = await _pay_with_card(
+                item_id, sess, into_pool, email, allow_fallback=True
+            )
+            if paid is not None:
+                return paid
+        else:
+            store.update_item(
+                item_id,
+                status="awaiting_external_payment",
+                message="等待外部支付（提交 payment_ref 后 resume）",
+                cookie_preview=_preview(_cookie_header(sess)) if sess.hatch_sess else None,
+                cookie_blob=_cookie_header(sess) if sess.hatch_sess else None,
+            )
+            _log(item_id, "到达 awaiting_external_payment（checkout 已关闭）")
+            return {"ok": True, "status": "awaiting_external_payment", "needs": ["payment_external"]}
+
+        # fallback: checkout refused this account (not admitted yet, or exit IP is geo-gated).
+        # Spend one code from a successful account, then accept the terms.
+        tos_ok = False
+        last_exc: MuseProtocolError | None = None
+        for attempt in (1, 2):
+            if attempt == 2 and (sess.checkout or {}).get("invite_redeemed"):
                 break
-    if not tos_ok:
-        exc = last_exc or MuseProtocolError(403, "accept_tos_failed", {})
-        det = exc.detail if isinstance(exc.detail, dict) else {}
-        msg = (
-            "checkout 不可用且 accept-tos 被拒：出口 IP 未放行 or 需要邀请码 "
-            f"({exc.status_code} {det.get('type') or det.get('error') or ''})"
-        )
-        store.update_item(item_id, status="geo_gated", message=msg, last_error=msg)
-        _log(item_id, msg, "error")
-        return {"ok": False, "status": "geo_gated", "needs": ["us_residential_proxy"]}
+            await _redeem_library_invite(item_id, sess, client)
+            try:
+                await client.accept_tos(sess)
+                _log(item_id, "accept-tos OK（该账号无需卡验证）")
+                tos_ok = True
+                break
+            except MuseProtocolError as exc:
+                last_exc = exc
+                if (sess.checkout or {}).get("invite_redeemed"):
+                    break
+
+        if tos_ok:
+            store.save_session_meta(item_id, _meta_from_sess(sess))
+            return await _finish_activation(item_id, sess, into_pool, email, tos_done=True)
+
+        last_geo_exc = last_exc or MuseProtocolError(403, "accept_tos_failed", {})
+        if _is_geo_blocked_error(last_geo_exc) and geo_round < MAX_GEO_PROXY_RETRIES:
+            next_label = _rotate_session_proxy(sess, tried_proxies)
+            if next_label:
+                store.save_session_meta(item_id, _meta_from_sess(sess))
+                _log(
+                    item_id,
+                    f"检测到地区受限 / {last_geo_exc.status_code}，切换代理重试（第 {geo_round + 1}/{MAX_GEO_PROXY_RETRIES} 次 · proxy={next_label}）",
+                    "warn",
+                )
+                await asyncio.sleep(1.0)
+                continue
+        break
+
+    exc = last_geo_exc or MuseProtocolError(403, "accept_tos_failed", {})
+    det = exc.detail if isinstance(exc.detail, dict) else {}
+    msg = (
+        f"已连续尝试 {max(1, len(tried_proxies))} 个代理仍地区受限（checkout 不可用且 accept-tos 被拒）："
+        f"{exc.status_code} {det.get('type') or det.get('error') or ''}"
+    ).strip()
     store.save_session_meta(item_id, _meta_from_sess(sess))
-    return await _finish_activation(item_id, sess, into_pool, email, tos_done=True)
+    store.update_item(item_id, status="geo_gated", message=msg, last_error=msg)
+    _log(item_id, msg, "error")
+    return {"ok": False, "status": "geo_gated", "needs": ["us_residential_proxy"]}
 
 
 def _sync_mail_token(client: Any, item_id: str) -> None:
@@ -937,8 +1051,6 @@ async def run_until_blocked(item_id: str, *, otp_code: str | None = None) -> dic
     secret = store.get_secret(item_id)
     meta = store.get_session_meta(item_id)
     sess = _sess_from_meta(meta)
-    proxy_label = _bind_session_proxy(item, sess)
-    client = get_muse_client(proxy=sess.proxy_url or None)
     profile: dict[str, Any] = {}
     try:
         profile = json.loads(item.get("profile_json") or "{}")
@@ -949,6 +1061,17 @@ async def run_until_blocked(item_id: str, *, otp_code: str | None = None) -> dic
     region = item.get("region") or "US"
     email = item.get("email") or ""
     into_pool = bool(item.get("into_pool"))
+    force_rotate_start = status in ("failed", "stopped", "geo_gated")
+    tried_start_proxies: set[str] = ({sess.proxy_url} if sess.proxy_url else set())
+    proxy_label = _bind_session_proxy(
+        item,
+        sess,
+        force_rotate=force_rotate_start,
+        exclude=tried_start_proxies if force_rotate_start else None,
+    )
+    client = get_muse_client(proxy=sess.proxy_url or None)
+    if sess.proxy_url:
+        tried_start_proxies.add(sess.proxy_url)
 
     def persist(status_: str, **extra: Any) -> None:
         store.save_session_meta(item_id, _meta_from_sess(sess))
@@ -977,18 +1100,52 @@ async def run_until_blocked(item_id: str, *, otp_code: str | None = None) -> dic
 
     _log(item_id, f"开始补号：{email}（当前状态 {status}）")
     try:
+        if status == "geo_gated":
+            _restore_sess_cookie(item, sess)
+            if sess.hatch_sess:
+                _log(item_id, f"检测到已有会话（geo_gated），换新代理重试验证/激活（proxy={proxy_label}）")
+                return await _after_session(
+                    item_id,
+                    sess,
+                    into_pool=into_pool,
+                    email=email,
+                    force_rotate_proxy=False,
+                    exclude=tried_start_proxies,
+                )
+            status = "pending"
+
         if status in ("pending", "failed", "stopped", "restarting"):
             if stopped():
                 persist("stopped", message="已停止")
                 return {"ok": True, "status": "stopped"}
             persist("restarting", message="restart…", tries=(item.get("tries") or 0) + 1)
-            await client.restart(sess, resume=False)
-            fp_id = (sess.fingerprint or {}).get("profile_id") or "?"
-            _log(
-                item_id,
-                f"restart OK（真站 {getattr(client, 'base', '?')} · proxy={proxy_label} · CSRF + password_encryption + fingerprint={fp_id}）",
-            )
-            otp_resp = await client.send_otp(sess, email, region)
+            otp_resp: dict[str, Any] | None = None
+            for pre_round in range(1, MAX_GEO_PROXY_RETRIES + 1):
+                client = get_muse_client(proxy=sess.proxy_url or None)
+                try:
+                    await client.restart(sess, resume=False)
+                    fp_id = (sess.fingerprint or {}).get("profile_id") or "?"
+                    _log(
+                        item_id,
+                        f"restart OK（真站 {getattr(client, 'base', '?')} · proxy={proxy_label} · CSRF + password_encryption + fingerprint={fp_id}）",
+                    )
+                    otp_resp = await client.send_otp(sess, email, region)
+                    break
+                except MuseProtocolError as exc:
+                    if _is_geo_blocked_error(exc) and pre_round < MAX_GEO_PROXY_RETRIES:
+                        next_label = _rotate_session_proxy(sess, tried_start_proxies)
+                        if next_label:
+                            proxy_label = next_label
+                            client = get_muse_client(proxy=sess.proxy_url or None)
+                            _log(
+                                item_id,
+                                f"登录前步骤遇到地区受限 / {exc.status_code}，换代理重试（第 {pre_round + 1}/{MAX_GEO_PROXY_RETRIES} 次 · proxy={next_label}）",
+                                "warn",
+                            )
+                            await asyncio.sleep(1.0)
+                            continue
+                    raise
+            assert otp_resp is not None
             _log(
                 item_id,
                 f"send-otp OK flow={otp_resp.get('flow')} pla={otp_resp.get('password_login_available')}",
@@ -1059,14 +1216,31 @@ async def run_until_blocked(item_id: str, *, otp_code: str | None = None) -> dic
                 f"name={profile.get('first_name')} {profile.get('last_name')} "
                 f"dob={dob}",
             )
-            await client.register_completion(
-                sess,
-                str(dob),
-                profile.get("tos_content_version") or sess.tos_content_version,
-                first_name=str(profile.get("first_name") or ""),
-                last_name=str(profile.get("last_name") or ""),
-                display_name=str(profile.get("display_name") or ""),
-            )
+            for reg_round in range(1, MAX_GEO_PROXY_RETRIES + 1):
+                try:
+                    await client.register_completion(
+                        sess,
+                        str(dob),
+                        profile.get("tos_content_version") or sess.tos_content_version,
+                        first_name=str(profile.get("first_name") or ""),
+                        last_name=str(profile.get("last_name") or ""),
+                        display_name=str(profile.get("display_name") or ""),
+                    )
+                    break
+                except MuseProtocolError as exc:
+                    if _is_geo_blocked_error(exc) and reg_round < MAX_GEO_PROXY_RETRIES:
+                        next_label = _rotate_session_proxy(sess, tried_start_proxies)
+                        if next_label:
+                            proxy_label = next_label
+                            client = get_muse_client(proxy=sess.proxy_url or None)
+                            _log(
+                                item_id,
+                                f"register-completion 遇到地区受限 / {exc.status_code}，换代理重试（第 {reg_round + 1}/{MAX_GEO_PROXY_RETRIES} 次 · proxy={next_label}）",
+                                "warn",
+                            )
+                            await asyncio.sleep(1.0)
+                            continue
+                    raise
             _log(item_id, "register-completion OK")
             sess.checkout = dict(sess.checkout or {})
             try:
@@ -1088,7 +1262,13 @@ async def run_until_blocked(item_id: str, *, otp_code: str | None = None) -> dic
             except Exception as exc:  # noqa: BLE001
                 sess.checkout["vm_assigned"] = False
                 _log(item_id, f"租用工作区未成功，注册继续，入池后会自动再分配：{exc}"[:200], "warn")
-            return await _after_session(item_id, sess, into_pool=into_pool, email=email)
+            return await _after_session(
+                item_id,
+                sess,
+                into_pool=into_pool,
+                email=email,
+                exclude=tried_start_proxies,
+            )
 
         if status == "awaiting_external_payment":
             return {
@@ -1134,11 +1314,13 @@ async def run_until_blocked(item_id: str, *, otp_code: str | None = None) -> dic
         return {"ok": True, "status": status}
     except MuseProtocolError as exc:
         msg = _format_protocol_error(exc)
-        persist("failed", last_error=msg[:800], message=f"失败: {msg[:400]}")
+        fail_status = "geo_gated" if _is_geo_blocked_error(exc) else "failed"
+        fail_msg = f"地区受限: {msg[:400]}" if fail_status == "geo_gated" else f"失败: {msg[:400]}"
+        persist(fail_status, last_error=msg[:800], message=fail_msg)
         _log(item_id, f"协议错误: {msg}", "error")
         return {
             "ok": False,
-            "status": "failed",
+            "status": fail_status,
             "error": exc.message,
             "status_code": exc.status_code,
             "detail": exc.detail if isinstance(exc.detail, dict) else {"detail": exc.detail},

@@ -187,12 +187,26 @@ def mask_proxy_url(url: str | None) -> str:
 current_item_id: ContextVar[str] = ContextVar("signup_item_id", default="")
 
 
-def fresh_sticky_proxy() -> str:
-    """Pick one proxy line and mint a new 8-char `{sid}`."""
+def fresh_sticky_proxy(exclude: str | set[str] | None = None) -> str:
+    """Pick a different proxy exit from the pool (or mint a new `{sid}` session)."""
     raw = getattr(get_settings(), "proxies", "") or ""
-    if "{sid}" not in raw:
+    pool = parse_proxy_list(raw)
+    if not pool:
         return ""
-    return pick_proxy(raw) or ""
+    ex = ({exclude} if isinstance(exclude, str) else set(exclude or ())) - {""}
+    has_sid = "{sid}" in raw
+    if not has_sid and len(pool) <= 1:
+        return ""
+
+    candidates = [u for u in pool if "{sid}" in u or u not in ex]
+    if not candidates:
+        return ""
+
+    for _ in range(8):
+        picked = expand_proxy_sid(random.choice(candidates))
+        if picked and picked not in ex:
+            return picked
+    return ""
 
 
 def _proxyish(exc: BaseException) -> bool:
@@ -205,11 +219,20 @@ def _proxyish(exc: BaseException) -> bool:
 
 
 def _rotate_proxy(sess: Any, nth: int) -> bool:
-    """Swap in a new sticky SID. Returns False when there is nothing to rotate."""
-    new = fresh_sticky_proxy()
-    if not new or new == (getattr(sess, "proxy_url", "") or ""):
+    """Swap in a new proxy exit / sticky SID. Returns False when nothing new exists."""
+    cur = getattr(sess, "proxy_url", "") or ""
+    tried = set(getattr(sess, "_tried_proxies", None) or ())
+    if cur:
+        tried.add(cur)
+    new = fresh_sticky_proxy(exclude=tried)
+    if not new or new in tried:
         return False
     sess.proxy_url = new
+    tried.add(new)
+    try:
+        sess._tried_proxies = tried
+    except Exception:
+        pass
     iid = current_item_id.get()
     if iid:
         from app.signup.store import add_log
@@ -230,13 +253,27 @@ def expand_proxy_sid(url: str | None, sid: str | None = None) -> str:
     return url.replace("{sid}", token)
 
 
-def pick_proxy(raw: str | None, preferred: str | None = None) -> str | None:
+def pick_proxy(
+    raw: str | None,
+    preferred: str | None = None,
+    *,
+    exclude: set[str] | None = None,
+) -> str | None:
+    ex = set(exclude or ()) - {""}
     pref = (preferred or "").strip()
-    if pref:
+    if pref and pref not in ex:
         return pref
     pool = parse_proxy_list(raw)
     if not pool:
         return None
+    if ex:
+        filtered = [u for u in pool if "{sid}" in u or u not in ex]
+        if filtered:
+            for _ in range(8):
+                chosen = expand_proxy_sid(random.choice(filtered))
+                if chosen not in ex:
+                    return chosen
+            return chosen
     return expand_proxy_sid(random.choice(pool))
 
 
@@ -1297,10 +1334,10 @@ class HttpMuseClient:
         html = res.text or ""
 
         def flag(name: str) -> bool:
-            return f'"{name}":true' in html
+            return f'"{name}":true' in html or f'\\"{name}\\":true' in html
 
         def text_of(name: str) -> str:
-            m = re.search(rf'"{name}":"([^"]*)"', html)
+            m = re.search(rf'(?:\\)?"{name}(?:\\)?":(?:\\)?"([^"\\]*)"?', html)
             return m.group(1) if m else ""
 
         state = {
