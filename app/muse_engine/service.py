@@ -274,11 +274,23 @@ def _messages_to_prompt(body: dict[str, Any]) -> str:
         if isinstance(content, list):
             texts = []
             for c in content:
-                if isinstance(c, dict) and c.get("type") == "text":
+                if isinstance(c, dict) and c.get("type") in ("text", "input_text", "output_text"):
                     texts.append(str(c.get("text") or ""))
                 elif isinstance(c, str):
                     texts.append(c)
-            content = "\n".join(texts)
+            content = "\n".join(t for t in texts if t)
+        tool_calls = m.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            calls_desc = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                calls_desc.append(f"[tool_call {fn.get('name', '')}({fn.get('arguments', '{}')})]")
+            tc_text = "\n".join(calls_desc)
+            content = f"{content}\n{tc_text}".strip() if content else tc_text
+        if role == "tool" and m.get("tool_call_id") and content:
+            content = f"[tool_result {m['tool_call_id']}]: {content}"
         if content:
             parts.append(f"{role}: {content}" if role != "user" else str(content))
     return "\n\n".join(parts).strip() or "hi"
@@ -383,115 +395,74 @@ def _sync_chat_stream(
     raise last_err or MuseGenerationError("chat failed")
 
 
-async def chat_completions(body: dict[str, Any]) -> Any:
-    """Return StreamingResponse-compatible async iterator OR dict for non-stream."""
-    from fastapi.responses import StreamingResponse
-
-    prompt = _messages_to_prompt(body)
-    stream = bool(body.get("stream"))
-    model = body.get("model") or "muse-spark"
-    timing = _new_request_timing()
-    timeout = body.get("timeout")
+async def run_text_completion(
+    prompt: str,
+    *,
+    timeout: int | None = None,
+    timing: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Run a non-streaming chat completion under the generation concurrency semaphore."""
+    timing = timing if timing is not None else _new_request_timing()
+    sem = _gen_semaphore()
+    await sem.acquire()
     try:
-        timeout_i = int(timeout) if timeout is not None else None
-    except (TypeError, ValueError):
-        timeout_i = None
+        def _run() -> str:
+            return "".join(_sync_chat_stream(prompt, timeout=timeout, timing=timing))
+
+        text = await asyncio.to_thread(_run)
+        return text, timing
+    finally:
+        sem.release()
+
+
+async def stream_text_sse(
+    *,
+    prompt: str,
+    timeout: int | None,
+    timing: dict[str, Any],
+    on_start=None,
+    on_delta,
+    on_done,
+    on_error,
+) -> Any:
+    """Shared concurrency-bounded SSE producer/consumer wrapper for chat/responses/messages."""
+    from fastapi.responses import StreamingResponse
 
     sem = _gen_semaphore()
     await sem.acquire()
-
-    if not stream:
-        try:
-            text_parts: list[str] = []
-
-            def _run() -> str:
-                out = ""
-                for d in _sync_chat_stream(prompt, timeout=timeout_i, timing=timing):
-                    out += d
-                return out
-
-            text = await asyncio.to_thread(_run)
-            return {
-                "id": "chatcmpl-" + uuid.uuid4().hex[:12],
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                },
-                "muse_timing": timing,
-            }
-        finally:
-            sem.release()
-
-    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
     def _producer() -> None:
+        parts: list[str] = []
         try:
-            for d in _sync_chat_stream(prompt, timeout=timeout_i, timing=timing):
-                asyncio.run_coroutine_threadsafe(queue.put(d), loop).result()
-            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+            for d in _sync_chat_stream(prompt, timeout=timeout, timing=timing):
+                parts.append(d)
+                asyncio.run_coroutine_threadsafe(queue.put(("delta", d)), loop).result()
+            asyncio.run_coroutine_threadsafe(queue.put(("done", "".join(parts))), loop).result()
         except Exception as exc:  # noqa: BLE001
-            asyncio.run_coroutine_threadsafe(
-                queue.put(f"__ERROR__:{exc}"), loop
-            ).result()
+            asyncio.run_coroutine_threadsafe(queue.put(("error", str(exc))), loop).result()
 
     threading.Thread(target=_producer, daemon=True).start()
 
     async def event_gen() -> AsyncIterator[bytes]:
-        cid = "chatcmpl-" + uuid.uuid4().hex[:12]
         try:
+            if on_start is not None:
+                for frame in on_start():
+                    yield frame
             while True:
-                item = await queue.get()
-                if item is None:
-                    payload = {
-                        "id": cid,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [
-                            {"index": 0, "delta": {}, "finish_reason": "stop"}
-                        ],
-                        "muse_timing": timing,
-                    }
-                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
-                    yield b"data: [DONE]\n\n"
+                kind, payload = await queue.get()
+                if kind == "delta":
+                    for frame in on_delta(str(payload)):
+                        yield frame
+                elif kind == "done":
+                    for frame in on_done(str(payload), timing):
+                        yield frame
                     break
-                if isinstance(item, str) and item.startswith("__ERROR__:"):
-                    err = {
-                        "error": {
-                            "message": item[len("__ERROR__:") :],
-                            "type": "server_error",
-                            "code": "muse_engine_error",
-                        }
-                    }
-                    yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode()
-                    yield b"data: [DONE]\n\n"
+                elif kind == "error":
+                    for frame in on_error(str(payload)):
+                        yield frame
                     break
-                payload = {
-                    "id": cid,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": item},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
         finally:
             sem.release()
 
@@ -504,6 +475,168 @@ async def chat_completions(body: dict[str, Any]) -> Any:
             "Connection": "keep-alive",
             "X-Muse-Request-Id": str(timing.get("request_id") or ""),
         },
+    )
+
+
+def _parse_timeout(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def chat_completions(body: dict[str, Any]) -> Any:
+    """Return StreamingResponse-compatible SSE OR dict for OpenAI /v1/chat/completions."""
+    prompt = _messages_to_prompt(body)
+    stream = bool(body.get("stream"))
+    model = body.get("model") or "muse-spark"
+    timing = _new_request_timing()
+    timeout_i = _parse_timeout(body.get("timeout"))
+
+    if not stream:
+        text, timing = await run_text_completion(prompt, timeout=timeout_i, timing=timing)
+        return {
+            "id": "chatcmpl-" + uuid.uuid4().hex[:12],
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+            "muse_timing": timing,
+        }
+
+    cid = "chatcmpl-" + uuid.uuid4().hex[:12]
+
+    def _on_delta(d: str) -> list[bytes]:
+        payload = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": None}],
+        }
+        return [f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()]
+
+    def _on_done(_full: str, t: dict[str, Any]) -> list[bytes]:
+        payload = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "muse_timing": t,
+        }
+        return [
+            f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode(),
+            b"data: [DONE]\n\n",
+        ]
+
+    def _on_error(msg: str) -> list[bytes]:
+        err = {
+            "error": {
+                "message": msg,
+                "type": "server_error",
+                "code": "muse_engine_error",
+            }
+        }
+        return [
+            f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode(),
+            b"data: [DONE]\n\n",
+        ]
+
+    return await stream_text_sse(
+        prompt=prompt,
+        timeout=timeout_i,
+        timing=timing,
+        on_delta=_on_delta,
+        on_done=_on_done,
+        on_error=_on_error,
+    )
+
+
+async def responses_completions(body: dict[str, Any]) -> Any:
+    """Serve OpenAI /v1/responses and /responses (non-stream JSON or Responses SSE)."""
+    from app.compat_api import (
+        ResponsesStreamSerializer,
+        estimate_tokens,
+        responses_non_stream_payload,
+        responses_to_chat,
+    )
+
+    chat_body = responses_to_chat(body)
+    prompt = _messages_to_prompt(chat_body)
+    model = str(chat_body.get("model") or "muse-spark")
+    stream = bool(chat_body.get("stream"))
+    timeout_i = _parse_timeout(chat_body.get("timeout"))
+    timing = _new_request_timing()
+    in_tokens = estimate_tokens(body.get("instructions"), body.get("input"), body.get("tools"))
+
+    if not stream:
+        text, timing = await run_text_completion(prompt, timeout=timeout_i, timing=timing)
+        return responses_non_stream_payload(
+            model=model,
+            text=text,
+            input_tokens=in_tokens,
+            timing=timing,
+        )
+
+    ser = ResponsesStreamSerializer(model=model, input_tokens=in_tokens)
+    return await stream_text_sse(
+        prompt=prompt,
+        timeout=timeout_i,
+        timing=timing,
+        on_start=ser.on_start,
+        on_delta=ser.on_delta,
+        on_done=ser.on_done,
+        on_error=ser.on_error,
+    )
+
+
+async def anthropic_messages(body: dict[str, Any]) -> Any:
+    """Serve Anthropic /v1/messages (non-stream JSON or Anthropic SSE)."""
+    from app.compat_api import (
+        AnthropicStreamSerializer,
+        anthropic_messages_to_chat,
+        anthropic_non_stream_payload,
+        estimate_tokens,
+    )
+
+    chat_body = anthropic_messages_to_chat(body)
+    prompt = _messages_to_prompt(chat_body)
+    model = str(chat_body.get("model") or "muse-spark")
+    stream = bool(chat_body.get("stream"))
+    timeout_i = _parse_timeout(chat_body.get("timeout"))
+    timing = _new_request_timing()
+    in_tokens = estimate_tokens(body.get("system"), body.get("messages"), body.get("tools"))
+
+    if not stream:
+        text, timing = await run_text_completion(prompt, timeout=timeout_i, timing=timing)
+        return anthropic_non_stream_payload(
+            model=model,
+            text=text,
+            input_tokens=in_tokens,
+            timing=timing,
+        )
+
+    ser = AnthropicStreamSerializer(model=model, input_tokens=in_tokens)
+    return await stream_text_sse(
+        prompt=prompt,
+        timeout=timeout_i,
+        timing=timing,
+        on_start=ser.on_start,
+        on_delta=ser.on_delta,
+        on_done=ser.on_done,
+        on_error=ser.on_error,
     )
 
 

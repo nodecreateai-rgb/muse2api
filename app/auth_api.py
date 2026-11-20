@@ -20,6 +20,18 @@ def extract_bearer(authorization: str | None) -> str | None:
     return token or None
 
 
+def extract_api_key(
+    authorization: str | None = None,
+    x_api_key: str | None = None,
+) -> str | None:
+    """Accept both `Authorization: Bearer <key>` and Anthropic `x-api-key: <key>`."""
+    token = extract_bearer(authorization)
+    if token:
+        return token
+    alt = (x_api_key or "").strip()
+    return alt or None
+
+
 def openai_http_error(
     status: int,
     message: str,
@@ -53,14 +65,17 @@ def openai_http_error(
     )
 
 
-def _accept_bearer(authorization: str | None) -> tuple[str, str, dict[str, Any] | None]:
+def _accept_bearer(
+    authorization: str | None,
+    x_api_key: str | None = None,
+) -> tuple[str, str, dict[str, Any] | None]:
     """Return (token, kind, db_row_or_none). kind: console|env|user."""
     settings = get_settings()
-    token = extract_bearer(authorization)
+    token = extract_api_key(authorization, x_api_key)
     if not token:
         raise openai_http_error(
             401,
-            "Missing Authorization: Bearer <key>",
+            "Missing API key (Authorization: Bearer <key> or x-api-key)",
             code="missing_api_key",
         )
 
@@ -123,24 +138,32 @@ def _apply_auth_state(
 def require_bearer_key(
     request: Request,
     authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ) -> str:
-    token, kind, row = _accept_bearer(authorization)
+    token, kind, row = _accept_bearer(authorization, x_api_key)
     return _apply_auth_state(request, token, kind, row)
 
 
-def validate_bearer_key(authorization: str | None) -> str:
-    token, _kind, _row = _accept_bearer(authorization)
+def validate_bearer_key(
+    authorization: str | None,
+    x_api_key: str | None = None,
+) -> str:
+    token, _kind, _row = _accept_bearer(authorization, x_api_key)
     return token
 
 
 def validate_bearer_key_detailed(
     authorization: str | None,
+    x_api_key: str | None = None,
 ) -> tuple[str, str, dict[str, Any] | None]:
-    return _accept_bearer(authorization)
+    return _accept_bearer(authorization, x_api_key)
 
 
 def optional_bearer_from_request(request: Request) -> str | None:
-    return extract_bearer(request.headers.get("authorization"))
+    return extract_api_key(
+        request.headers.get("authorization"),
+        request.headers.get("x-api-key"),
+    )
 
 
 def source_for_request(request: Request) -> str:

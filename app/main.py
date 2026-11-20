@@ -42,6 +42,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(admin_auth.router)
 app.include_router(v1.router)
+app.include_router(v1.compat_root_router)
 
 app.include_router(generate.router, prefix="/api")
 app.include_router(records.router, prefix="/api")
@@ -72,7 +73,11 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     # /v1 already uses OpenAI-shaped detail dicts from auth_api/proxy.
     if isinstance(detail, dict) and "error" in detail:
         return JSONResponse(status_code=exc.status_code, content=detail)
-    if request.url.path.startswith("/v1/"):
+    if (
+        request.url.path.startswith("/v1/")
+        or request.url.path in ("/responses", "/messages", "/messages/count_tokens", "/models")
+        or request.url.path.startswith("/models/")
+    ):
         message = detail if isinstance(detail, str) else str(detail)
         status = exc.status_code
         err_type = (

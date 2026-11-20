@@ -9,11 +9,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.auth_admin import get_session_user
 from app.auth_api import (
+    extract_api_key,
     extract_bearer,
     openai_http_error,
     require_bearer_key,
@@ -25,6 +26,7 @@ from app.config import get_settings
 from app.media_rewrite import is_safe_media_name, request_public_base
 
 router = APIRouter(prefix="/v1", tags=["v1"])
+compat_root_router = APIRouter(tags=["v1-compat"])
 
 
 
@@ -97,6 +99,118 @@ def _collect_video_refs(body: dict[str, Any]) -> list[str]:
     )
 
 
+def _compat_prompt_preview(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    if isinstance(body.get("prompt"), str) and body["prompt"].strip():
+        return body["prompt"].strip()[:160]
+    msgs = body.get("messages")
+    if isinstance(msgs, list) and msgs:
+        last = msgs[-1]
+        if isinstance(last, dict):
+            c = last.get("content")
+            if isinstance(c, str) and c.strip():
+                return c.strip()[:160]
+            if isinstance(c, list):
+                texts = [str(p.get("text") or "") for p in c if isinstance(p, dict) and p.get("text")]
+                if texts:
+                    return " ".join(texts).strip()[:160]
+    raw_in = body.get("input")
+    if isinstance(raw_in, str) and raw_in.strip():
+        return raw_in.strip()[:160]
+    if isinstance(raw_in, list) and raw_in:
+        for item in reversed(raw_in):
+            if isinstance(item, dict) and isinstance(item.get("content"), str) and item["content"].strip():
+                return item["content"].strip()[:160]
+            if isinstance(item, dict) and isinstance(item.get("output"), str) and item["output"].strip():
+                return item["output"].strip()[:160]
+    return None
+
+
+async def _run_text_compat_endpoint(
+    request: Request,
+    key: str,
+    *,
+    log_path: str,
+    runner,
+    anthropic_errors: bool = False,
+):
+    from app.muse_engine.engine import MuseAuthError, MuseGenerationError, MuseProxyError
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        if anthropic_errors:
+            raise HTTPException(
+                status_code=400,
+                detail={"type": "error", "error": {"type": "invalid_request_error", "message": "invalid json body"}},
+            )
+        raise openai_http_error(400, "invalid json body", code="invalid_request")
+
+    t0 = time.time()
+    prompt = _compat_prompt_preview(body)
+    model = body.get("model")
+    stream = bool(body.get("stream"))
+    try:
+        resp = await runner(body)
+        write_call_log(
+            path=log_path,
+            method="POST",
+            api_type="chat",
+            model=model,
+            stream=stream,
+            status=200,
+            latency_ms=int((time.time() - t0) * 1000),
+            source=source_for_request(request),
+            key=key,
+            prompt_preview=prompt,
+        )
+        return resp
+    except ValueError as exc:
+        write_call_log(
+            path=log_path,
+            method="POST",
+            api_type="chat",
+            model=model,
+            stream=stream,
+            status=400,
+            latency_ms=int((time.time() - t0) * 1000),
+            source=source_for_request(request),
+            key=key,
+            error=str(exc),
+            prompt_preview=prompt,
+        )
+        if anthropic_errors:
+            raise HTTPException(
+                status_code=400,
+                detail={"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}},
+            ) from exc
+        raise openai_http_error(400, str(exc), code="invalid_request") from exc
+    except (MuseGenerationError, MuseAuthError, MuseProxyError, Exception) as exc:
+        write_call_log(
+            path=log_path,
+            method="POST",
+            api_type="chat",
+            model=model,
+            stream=stream,
+            status=502,
+            latency_ms=int((time.time() - t0) * 1000),
+            source=source_for_request(request),
+            key=key,
+            error=str(exc),
+            prompt_preview=prompt,
+        )
+        if anthropic_errors:
+            raise HTTPException(
+                status_code=502,
+                detail={"type": "error", "error": {"type": "api_error", "message": str(exc)}},
+            ) from exc
+        _map_engine_error(exc)
+
+
+@compat_root_router.get("/models")
 @router.get("/models")
 async def list_models(
     request: Request,
@@ -107,53 +221,90 @@ async def list_models(
     return local_models()
 
 
+@compat_root_router.get("/models/{model_id:path}")
+@router.get("/models/{model_id:path}")
+async def get_model(
+    model_id: str,
+    request: Request,
+    key: str = Depends(require_bearer_key),
+):
+    from app.muse_engine.service import local_models
+
+    for row in local_models().get("data") or []:
+        if row.get("id") == model_id:
+            return row
+    raise openai_http_error(404, "model not found", code="model_not_found")
+
+
 @router.post("/chat/completions")
 async def chat_completions(
     request: Request,
     key: str = Depends(require_bearer_key),
 ):
-    from app.muse_engine.engine import MuseAuthError, MuseGenerationError, MuseProxyError
     from app.muse_engine.service import chat_completions as local_chat
 
-    body = await request.json()
-    t0 = time.time()
-    prompt = None
-    if isinstance(body, dict):
-        msgs = body.get("messages") if isinstance(body.get("messages"), list) else []
-        if msgs and isinstance(msgs[-1], dict) and isinstance(msgs[-1].get("content"), str):
-            prompt = msgs[-1]["content"].strip()[:160]
-        elif isinstance(body.get("prompt"), str):
-            prompt = body["prompt"].strip()[:160]
+    return await _run_text_compat_endpoint(
+        request,
+        key,
+        log_path="/v1/chat/completions",
+        runner=local_chat,
+    )
+
+
+@compat_root_router.post("/responses")
+@router.post("/responses")
+async def responses_create(
+    request: Request,
+    key: str = Depends(require_bearer_key),
+):
+    from app.muse_engine.service import responses_completions
+
+    return await _run_text_compat_endpoint(
+        request,
+        key,
+        log_path="/v1/responses",
+        runner=responses_completions,
+    )
+
+
+@compat_root_router.post("/messages")
+@router.post("/messages")
+async def messages_create(
+    request: Request,
+    key: str = Depends(require_bearer_key),
+):
+    from app.muse_engine.service import anthropic_messages
+
+    return await _run_text_compat_endpoint(
+        request,
+        key,
+        log_path="/v1/messages",
+        runner=anthropic_messages,
+        anthropic_errors=True,
+    )
+
+
+@compat_root_router.post("/messages/count_tokens")
+@router.post("/messages/count_tokens")
+async def messages_count_tokens(
+    request: Request,
+    key: str = Depends(require_bearer_key),
+):
+    from app.compat_api import anthropic_count_tokens
+
     try:
-        resp = await local_chat(body if isinstance(body, dict) else {})
-        write_call_log(
-            path="/v1/chat/completions",
-            method="POST",
-            api_type="chat",
-            model=(body or {}).get("model") if isinstance(body, dict) else None,
-            stream=bool((body or {}).get("stream")) if isinstance(body, dict) else False,
-            status=200,
-            latency_ms=int((time.time() - t0) * 1000),
-            source=source_for_request(request),
-            key=key,
-            prompt_preview=prompt,
-        )
-        return resp
-    except (MuseGenerationError, MuseAuthError, MuseProxyError, Exception) as exc:
-        write_call_log(
-            path="/v1/chat/completions",
-            method="POST",
-            api_type="chat",
-            model=(body or {}).get("model") if isinstance(body, dict) else None,
-            stream=bool((body or {}).get("stream")) if isinstance(body, dict) else False,
-            status=502,
-            latency_ms=int((time.time() - t0) * 1000),
-            source=source_for_request(request),
-            key=key,
-            error=str(exc),
-            prompt_preview=prompt,
-        )
-        _map_engine_error(exc)
+        body = await request.json()
+        return anthropic_count_tokens(body)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}},
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"type": "error", "error": {"type": "invalid_request_error", "message": "bad body"}},
+        ) from exc
 
 
 @router.post("/images/generations")
@@ -607,6 +758,7 @@ async def get_media(
     name: str,
     request: Request,
     authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ):
     settings = get_settings()
     if not is_safe_media_name(name):
@@ -615,9 +767,9 @@ async def get_media(
     key: str | None = None
     source = "external"
     if settings.media_auth_required:
-        bearer = extract_bearer(authorization)
-        if bearer:
-            key, kind, row = validate_bearer_key_detailed(authorization)
+        token = extract_api_key(authorization, x_api_key)
+        if token:
+            key, kind, row = validate_bearer_key_detailed(authorization, x_api_key)
             request.state.key_kind = kind
             request.state.key_id = int(row["id"]) if row else None
             request.state.key_row = row
@@ -630,11 +782,11 @@ async def get_media(
         else:
             raise openai_http_error(
                 401,
-                "Missing Authorization: Bearer <key>",
+                "Missing API key (Authorization: Bearer <key> or x-api-key)",
                 code="missing_api_key",
             )
     else:
-        key = extract_bearer(authorization)
+        key = extract_api_key(authorization, x_api_key)
 
     from app.muse_engine.service import media_path
 
