@@ -373,6 +373,8 @@ def _sync_chat_stream(
             pool_store.reset_408(aid)
             return
         except (MuseAuthError, MuseProxyError, MuseGenerationError) as exc:
+            if not acc and last_err is not None and str(exc) == EMPTY_POOL_MSG:
+                break
             last_err = exc
             _note_account_failure(str(acc.get("id") or ""), exc)
             logger.warning("chat attempt %s failed: %s", attempt + 1, exc)
@@ -835,10 +837,10 @@ def quota(aid: str) -> dict[str, Any]:
     return eng.quota(cookies, expires, account_id=aid)
 
 
-def media_url(name: str) -> str:
+def media_url(name: str, *, base_url: str | None = None) -> str:
     from app.config import get_settings
 
-    base = (getattr(get_settings(), "public_base", None) or "").rstrip("/")
+    base = (base_url or getattr(get_settings(), "public_base", None) or "").rstrip("/")
     return f"{base}/v1/media/{name}" if base else f"/v1/media/{name}"
 
 
@@ -966,6 +968,8 @@ def run_generation(
             res["_engine_attempts"] = attempts
             return res, str(acc["id"])
         except (MuseAuthError, MuseProxyError, MuseGenerationError) as exc:
+            if not acc_row and last_err is not None and str(exc) == EMPTY_POOL_MSG:
+                break
             last_err = exc
             _note_account_failure(str(acc_row.get("id") or ""), exc)
             attempts.append(
@@ -994,13 +998,14 @@ def image_response(
     *,
     size: str | None = None,
     response_format: str = "url",
+    base_url: str | None = None,
 ) -> dict[str, Any]:
     import base64
     import os
 
     item: dict[str, Any] = {
         "revised_prompt": prompt,
-        "url": media_url(res["filename"]),
+        "url": media_url(res["filename"], base_url=base_url),
         "size": size or "auto",
         "kind": res.get("kind"),
         "bytes": res.get("size"),
@@ -1022,6 +1027,7 @@ def queue_image_task(
     response_format: str = "url",
     timeout: int | None = None,
     idempotency_key: str | None = None,
+    base_url: str | None = None,
 ) -> dict[str, Any]:
     import hashlib
 
@@ -1091,7 +1097,7 @@ def queue_image_task(
                 reference_images=reference_images,
                 on_progress=lambda p: task_store.update_task(tid, progress=p),
             )
-            done_url = media_url(res["filename"])
+            done_url = media_url(res["filename"], base_url=base_url)
             task_store.update_task(
                 tid,
                 status="completed",
@@ -1141,6 +1147,7 @@ def queue_video_task(
     api_prompt: str,
     reference_images: list[str],
     timeout: int | None = None,
+    base_url: str | None = None,
 ) -> dict[str, Any]:
     from app.muse_engine import tasks as task_store
 
@@ -1161,7 +1168,7 @@ def queue_video_task(
                 reference_images=reference_images,
                 on_progress=lambda p: task_store.update_task(tid, progress=p),
             )
-            vurl = media_url(res["filename"])
+            vurl = media_url(res["filename"], base_url=base_url)
             task_store.update_task(
                 tid,
                 status="completed",
@@ -1205,7 +1212,7 @@ def queue_video_task(
     }
 
 
-def get_image_task_view(task_id: str) -> dict[str, Any] | None:
+def get_image_task_view(task_id: str, *, base_url: str | None = None) -> dict[str, Any] | None:
     from app.muse_engine import tasks as task_store
 
     task = task_store.get_task(task_id)
@@ -1214,18 +1221,23 @@ def get_image_task_view(task_id: str) -> dict[str, Any] | None:
     out = dict(task)
     if out.get("status") == "completed" and isinstance(out.get("result"), dict):
         fmt = out.get("response_format") or "url"
-        out.update(
-            image_response(
-                out.get("prompt") or "",
-                out["result"],
-                size=out.get("size"),
-                response_format=fmt,
-            )
+        resp = image_response(
+            out.get("prompt") or "",
+            out["result"],
+            size=out.get("size"),
+            response_format=fmt,
+            base_url=base_url,
         )
+        out.update(resp)
+        if fmt != "b64_json" and resp.get("data"):
+            top_url = resp["data"][0].get("url")
+            if top_url:
+                out["url"] = top_url
+                out["result"] = {**out["result"], "url": top_url}
     return out
 
 
-def get_video_task_view(task_id: str) -> dict[str, Any] | None:
+def get_video_task_view(task_id: str, *, base_url: str | None = None) -> dict[str, Any] | None:
     from app.muse_engine import tasks as task_store
 
     t = task_store.get_task(task_id)
@@ -1240,10 +1252,13 @@ def get_video_task_view(task_id: str) -> dict[str, Any] | None:
     elif out.get("status") == "processing":
         out["progress"] = max(out.get("progress", 0) or 0, 15)
     vurl = out.get("url")
-    if not vurl and isinstance(out.get("result"), dict):
-        vurl = out["result"].get("url")
+    res_obj = out.get("result") if isinstance(out.get("result"), dict) else None
+    if res_obj and res_obj.get("filename"):
+        vurl = media_url(str(res_obj["filename"]), base_url=base_url)
+        out["result"] = {**res_obj, "url": vurl}
+    elif not vurl and res_obj:
+        vurl = res_obj.get("url")
     if vurl:
         out["url"] = vurl
-        if "video" not in out:
-            out["video"] = {"url": vurl}
+        out["video"] = {"url": vurl}
     return out

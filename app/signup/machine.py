@@ -394,7 +394,11 @@ async def _push_pool(item_id: str, email: str, cookie_header: str) -> str | None
             fingerprint=fp or {"profile_id": fp_id},
             signup_item_id=item_id,
         )
-    _log(item_id, f"注册成功 · 已设密 · 已获取Cookie · 指纹={fp_id} · 已导入本库号池 id={aid}")
+    has_pwd = bool(secret.get("muse_login_password"))
+    _log(
+        item_id,
+        f"注册成功 · {'已设密' if has_pwd else '未设密'} · 已获取Cookie · 指纹={fp_id} · 已导入本库号池 id={aid}",
+    )
     if aid and assigned_flag is False:
         try:
             from app.jobs_keepalive import kick_assign
@@ -437,6 +441,77 @@ def _transient_failure(exc: MuseProtocolError) -> bool:
     )
 
 
+_CARD_WAIT_LOOP: asyncio.AbstractEventLoop | None = None
+_CARD_WAIT_COND: asyncio.Condition | None = None
+_CARD_WAIT_TIMEOUT_SEC = 600.0
+_CARD_STALE_IN_USE_SEC = 300
+
+
+def _get_card_cond() -> asyncio.Condition:
+    global _CARD_WAIT_LOOP, _CARD_WAIT_COND
+    loop = asyncio.get_running_loop()
+    if _CARD_WAIT_COND is None or _CARD_WAIT_LOOP is not loop:
+        _CARD_WAIT_LOOP = loop
+        _CARD_WAIT_COND = asyncio.Condition()
+    return _CARD_WAIT_COND
+
+
+async def _notify_card_released() -> None:
+    cond = _get_card_cond()
+    async with cond:
+        cond.notify_all()
+
+
+async def _acquire_card_queued(
+    item_id: str,
+    *,
+    card_id: str | None = None,
+    wait_timeout_sec: float = _CARD_WAIT_TIMEOUT_SEC,
+) -> dict[str, Any] | None:
+    """Claim a card, waiting in FIFO order while occupied cards keep making progress."""
+    from app.cards import store as cards_store
+
+    idle_timeout = max(5.0, wait_timeout_sec)
+    last_progress = time.monotonic()
+    last_snap: tuple[tuple[str, int, str, str], ...] = ()
+    logged_wait = False
+    while not stopped():
+        card = (
+            cards_store.claim_card_by_id(card_id, item_id)
+            if card_id
+            else cards_store.claim_card(item_id)
+        )
+        if card:
+            return card
+        snap = cards_store.in_use_snapshot(card_id=card_id)
+        in_use = len(snap)
+        if in_use <= 0:
+            return None
+        if snap != last_snap:
+            last_snap = snap
+            last_progress = time.monotonic()
+        if time.monotonic() - last_progress >= idle_timeout:
+            cards_store.recover_stale_in_use(max_age_sec=_CARD_STALE_IN_USE_SEC)
+            return (
+                cards_store.claim_card_by_id(card_id, item_id)
+                if card_id
+                else cards_store.claim_card(item_id)
+            )
+        if not logged_wait:
+            logged_wait = True
+            wait_msg = f"卡占用中（{in_use} 张使用中），排队等待空闲卡…"
+            store.update_item(item_id, status="awaiting_card", message=wait_msg)
+            _log(item_id, wait_msg)
+        cards_store.recover_stale_in_use(max_age_sec=_CARD_STALE_IN_USE_SEC)
+        cond = _get_card_cond()
+        async with cond:
+            try:
+                await asyncio.wait_for(cond.wait(), timeout=1.5)
+            except asyncio.TimeoutError:
+                pass
+    return None
+
+
 def _card_label(card: dict[str, Any]) -> str:
     return f"{card.get('brand') or 'Card'} •••• {card.get('last4') or '????'}"
 
@@ -448,7 +523,7 @@ async def _charge_card(
     into_pool: bool,
     email: str,
 ) -> dict[str, Any]:
-    """Run one checkout with an already-claimed card."""
+    """Run one checkout with an already-claimed card, then release it immediately."""
     from app.cards import store as cards_store
 
     client = get_muse_client(proxy=sess.proxy_url or None)
@@ -460,45 +535,67 @@ async def _charge_card(
         message=f"checkout 支付中 · {label}",
     )
     try:
-        result = await client.run_checkout(sess, card)
-        for step in result.get("steps") or []:
-            _log(item_id, step)
-    except MuseProtocolError as exc:
-        msg = _format_protocol_error(exc)
-        # 卡池策略：失败一律计数并放回卡池复用，超过 3 次才自动禁用
-        hard = False
-        transient = _transient_failure(exc)
-        if transient:
+        try:
+            result = await client.run_checkout(sess, card)
+            for step in result.get("steps") or []:
+                _log(item_id, step)
+        except asyncio.CancelledError:
             cards_store.release_card(card["id"], status="available")
-            state = "放回卡池（不算失败）"
-        else:
-            new_state = cards_store.record_failure(
-                card["id"], msg, hard=hard, item_id=item_id
-            )
-            info = cards_store.get_card(card["id"]) or {}
-            fails = info.get("fail_count") or 0
-            state = (
-                f"已禁用（失败 {fails}/{cards_store.MAX_CARD_FAILURES}）"
-                if new_state == "disabled"
-                else f"放回卡池（失败 {fails}/{cards_store.MAX_CARD_FAILURES}）"
-            )
-        store.save_session_meta(item_id, _meta_from_sess(sess))
-        store.update_item(item_id, last_error=msg[:800])
-        _log(item_id, f"卡 {label} {state}: {msg[:300]}", "error")
-        return {"ok": False, "error": msg, "label": label}
-    except Exception as exc:  # noqa: BLE001
-        msg = f"{type(exc).__name__}: {exc}"[:400]
-        cards_store.release_card(card["id"], status="failed", error=msg)
-        store.update_item(item_id, last_error=msg[:800])
-        _log(item_id, f"卡 {label} 异常: {msg}", "error")
-        return {"ok": False, "error": msg, "label": label}
+            raise
+        except MuseProtocolError as exc:
+            msg = _format_protocol_error(exc)
+            # 卡池策略：失败一律计数并放回卡池复用，超过 3 次才自动禁用
+            hard = False
+            transient = _transient_failure(exc)
+            if transient:
+                cards_store.release_card(card["id"], status="available")
+                state = "放回卡池（不算失败）"
+            else:
+                new_state = cards_store.record_failure(
+                    card["id"], msg, hard=hard, item_id=item_id
+                )
+                info = cards_store.get_card(card["id"]) or {}
+                fails = info.get("fail_count") or 0
+                state = (
+                    f"已禁用（失败 {fails}/{cards_store.MAX_CARD_FAILURES}）"
+                    if new_state == "disabled"
+                    else f"放回卡池（失败 {fails}/{cards_store.MAX_CARD_FAILURES}）"
+                )
+            store.save_session_meta(item_id, _meta_from_sess(sess))
+            store.update_item(item_id, last_error=msg[:800])
+            _log(item_id, f"卡 {label} {state}: {msg[:300]}", "error")
+            return {"ok": False, "error": msg, "label": label}
+        except Exception as exc:  # noqa: BLE001
+            msg = f"{type(exc).__name__}: {exc}"[:400]
+            low = msg.lower()
+            if any(w in low for w in ("timeout", "proxy", "connect", "curl", "socket", "eof", "reset")):
+                cards_store.release_card(card["id"], status="available", error=msg)
+                state = "网络波动，放回卡池（不算失败）"
+            else:
+                new_state = cards_store.record_failure(
+                    card["id"], msg, hard=False, item_id=item_id
+                )
+                info = cards_store.get_card(card["id"]) or {}
+                fails = info.get("fail_count") or 0
+                state = (
+                    f"已禁用（失败 {fails}/{cards_store.MAX_CARD_FAILURES}）"
+                    if new_state == "disabled"
+                    else f"放回卡池（失败 {fails}/{cards_store.MAX_CARD_FAILURES}）"
+                )
+            store.update_item(item_id, last_error=msg[:800])
+            _log(item_id, f"卡 {label} 异常 · {state}: {msg}", "error")
+            return {"ok": False, "error": msg, "label": label}
 
-    cards_store.mark_used(card["id"], item_id)
+        cards_store.mark_used(card["id"], item_id)
+    finally:
+        cards_store.release_if_in_use(card["id"], item_id)
+        await _notify_card_released()
+
     ptt = result.get("ptt") or {}
     _log(
         item_id,
         "checkout SUCCESS · "
-        f"{label} · order={result.get('order_id')} · "
+        f"{label}（已释放回卡池） · order={result.get('order_id')} · "
         f"credential={result.get('credential_id')} · "
         f"ptt_key={ptt.get('id') or '?'} chain={ptt.get('chain_len', 0)}",
     )
@@ -550,15 +647,20 @@ async def _pay_with_card(
         store.update_item(item_id, status="awaiting_card", message=msg, last_error=msg)
         return {"ok": False, "status": "awaiting_card", "needs": ["card"]}
 
-    # 2) card pool
+    # 2) card pool (if all cards are currently in_use, wait one by one)
     errors: list[str] = []
     for attempt in range(1, max_tries + 1):
-        card = cards_store.claim_card(item_id)
+        if attempt > 1:
+            await asyncio.sleep(1.0)
+        card = await _acquire_card_queued(item_id)
         if not card:
+            if stopped():
+                store.update_item(item_id, status="stopped", message="已停止")
+                return {"ok": True, "status": "stopped"}
             store.update_item(
                 item_id,
                 status="awaiting_card",
-                message="卡池无可用卡：请先在「卡池」导入卡，再点「继续支付」",
+                message="卡池无可用卡：请先在「卡池」导入或启用卡，再点「继续支付」",
             )
             _log(item_id, "卡池无可用卡 → awaiting_card", "warn")
             return {"ok": True, "status": "awaiting_card", "needs": ["card"]}
@@ -730,14 +832,32 @@ async def _finish_activation(
     item = store.get_item(item_id) or {}
     _bind_session_proxy(item, sess)
     client = get_muse_client(proxy=sess.proxy_url or None)
+    sess.checkout = dict(sess.checkout or {})
+    already_post_tos = bool(
+        tos_done
+        or sess.checkout.get("tos_accepted")
+        or (item.get("status") == "activating" and item.get("message") == "设置登录密码…")
+    )
     store.save_session_meta(item_id, _meta_from_sess(sess))
-    if not tos_done:
+    if not already_post_tos:
         store.update_item(item_id, status="activating", message="accept-tos / wake…")
         await client.accept_tos(sess)
+        sess.checkout["tos_accepted"] = True
+        store.save_session_meta(item_id, _meta_from_sess(sess))
         _log(item_id, "accept-tos OK")
         # 激活后才能租工作区：lease-vm 在未验卡/未 accept-tos 时会 403
         try:
             lease = await client.lease_vm(sess, "standard")
+            leased_ok = bool(
+                isinstance(lease, dict)
+                and (
+                    str(lease.get("status") or "") == "assigned"
+                    or lease.get("vmName")
+                    or lease.get("gatewayUrl")
+                )
+            )
+            if leased_ok:
+                sess.checkout["vm_assigned"] = True
             store.save_session_meta(item_id, _meta_from_sess(sess))
             _log(
                 item_id,
@@ -747,6 +867,8 @@ async def _finish_activation(
         except MuseProtocolError as exc:
             _log(item_id, f"工作区租用失败: {exc.status_code} {exc.message}"[:200], "warn")
     else:
+        if item.get("status") == "activating" and item.get("message") == "设置登录密码…":
+            sess.checkout["vm_assigned"] = True
         store.update_item(item_id, status="activating", message="wake…")
     # activation order from the capture: accept-tos → stateful-sharing → wake
     try:
@@ -1141,7 +1263,7 @@ async def apply_card_retry(item_id: str, card_id: str | None = None) -> dict[str
     into_pool = bool(item.get("into_pool"))
     email = item.get("email") or ""
     if card_id:
-        card = cards_store.claim_card_by_id(card_id, item_id)
+        card = await _acquire_card_queued(item_id, card_id=card_id)
         if not card:
             return {"ok": False, "error": "card_unavailable", "message": "该卡不可用（状态或有效期）"}
         _log(item_id, f"手工指定卡 {_card_label(card)} 支付")

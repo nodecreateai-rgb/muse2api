@@ -16,6 +16,7 @@ and the caller persists it (``signup_items.secret_enc``).
 from __future__ import annotations
 
 import asyncio
+import calendar
 import email
 import imaplib
 import logging
@@ -347,7 +348,7 @@ async def _graph_list(email_addr: str, access: str, limit: int) -> list[MailMess
                     sender = f"{frm['name']} <{frm['address']}>"
                 when = 0.0
                 try:
-                    when = time.mktime(time.strptime(row.get("receivedDateTime", "")[:19], "%Y-%m-%dT%H:%M:%S"))
+                    when = float(calendar.timegm(time.strptime(row.get("receivedDateTime", "")[:19], "%Y-%m-%dT%H:%M:%S")))
                 except Exception:
                     pass
                 out.append(

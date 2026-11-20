@@ -230,3 +230,125 @@ class TimingDeltaTests(unittest.TestCase):
         d = timing_deltas(marks)
         self.assertEqual(d["reuse"], 1.0)
         self.assertAlmostEqual(d["warm_to_stream_ms"], 200.0)
+
+
+class ProtocolVmStateTests(unittest.TestCase):
+    def test_unknown_vm_state_proceeds_to_token_while_stopped_raises(self):
+        import asyncio
+        from unittest import mock
+        from app.muse_engine.engine import MuseGenerationError
+        from app.muse_engine.protocol_client import HatchProtocolClient
+
+        client = HatchProtocolClient({"hatch_sess": "demo"})
+        calls = []
+
+        def fake_http(method, url, body=None):
+            calls.append((method, url))
+            if "api/session" in url:
+                return {
+                    "status": "assigned",
+                    "vm_id": "vm-1",
+                    "vm_name": "vm-1",
+                    "endpoint_url": "wss://vm-1.example.test/",
+                    "vm_state": "UNKNOWN",
+                    "vm_type": "hatch_vm",
+                }
+            if "api/hatch/token" in url:
+                # Stop right after token request succeeds (avoid real websocket dial)
+                raise MuseGenerationError("stop_after_token_probe")
+            raise AssertionError(f"unexpected http call: {method} {url}")
+
+        client._http = fake_http  # type: ignore[method-assign]
+        with self.assertRaises(MuseGenerationError) as ctx:
+            asyncio.run(client.connect())
+        self.assertIn("stop_after_token_probe", str(ctx.exception))
+        self.assertEqual(
+            [u.split("?")[0] for _, u in calls],
+            ["https://muse.ai/api/session", "https://muse.ai/api/hatch/token"],
+        )
+
+        # STOPPED should try wake and fail if still STOPPED
+        client2 = HatchProtocolClient({"hatch_sess": "demo"})
+        calls2 = []
+
+        def fake_stopped(method, url, body=None):
+            calls2.append((method, url))
+            if "api/session" in url:
+                return {
+                    "status": "assigned",
+                    "vm_id": "vm-1",
+                    "endpoint_url": "wss://vm-1.example.test/",
+                    "vm_state": "STOPPED",
+                    "vm_type": "hatch_vm",
+                }
+            if "vm/wake" in url:
+                return {"status": "wake_requested"}
+            raise AssertionError(f"unexpected http call: {method} {url}")
+
+        client2._http = fake_stopped  # type: ignore[method-assign]
+        with self.assertRaises(MuseGenerationError) as ctx2:
+            asyncio.run(client2.connect())
+        self.assertIn("state=STOPPED", str(ctx2.exception))
+        self.assertTrue(any("vm/wake" in u for _, u in calls2))
+
+    def test_rotation_preserves_real_error_instead_of_empty_pool(self):
+        from unittest import mock
+        from app.muse_engine import service
+        from app.muse_engine.engine import MuseGenerationError
+
+        picked = []
+
+        def fake_pick(*, force_rotate=False, exclude_ids=None):
+            if exclude_ids and "acc1" in exclude_ids:
+                raise MuseGenerationError(service.EMPTY_POOL_MSG)
+            picked.append("acc1")
+            return {"id": "acc1", "cookies": {"hatch_sess": "x"}}
+
+        with mock.patch.object(service, "_pick", side_effect=fake_pick), \
+             mock.patch.object(service, "_renew_if_needed", side_effect=MuseGenerationError("Muse real error")):
+            with self.assertRaises(MuseGenerationError) as ctx:
+                service.run_generation("hello", "image", timeout=10)
+        self.assertEqual(str(ctx.exception), "Muse real error")
+
+
+class MediaHostTests(unittest.TestCase):
+    def test_request_public_base_prefers_external_host_and_falls_back_on_loopback(self):
+        from types import SimpleNamespace
+        from app.config import Settings
+        from app.media_rewrite import request_public_base, rewrite_media_string
+
+        s = Settings(public_base="http://23.106.46.111:8090")
+        req_ext = SimpleNamespace(
+            headers={"host": "23.106.46.111:8090"},
+            url=SimpleNamespace(scheme="http", netloc="23.106.46.111:8090"),
+        )
+        self.assertEqual(request_public_base(req_ext, s), "http://23.106.46.111:8090")
+
+        req_proxy = SimpleNamespace(
+            headers={
+                "host": "127.0.0.1:8090",
+                "x-forwarded-host": "muse.example.com",
+                "x-forwarded-proto": "https",
+            },
+            url=SimpleNamespace(scheme="http", netloc="127.0.0.1:8090"),
+        )
+        self.assertEqual(request_public_base(req_proxy, s), "https://muse.example.com")
+
+        req_local = SimpleNamespace(
+            headers={"host": "127.0.0.1:8090"},
+            url=SimpleNamespace(scheme="http", netloc="127.0.0.1:8090"),
+        )
+        self.assertEqual(request_public_base(req_local, s), "http://23.106.46.111:8090")
+
+        req_docker = SimpleNamespace(
+            headers={"host": "172.17.0.1:8090"},
+            url=SimpleNamespace(scheme="http", netloc="172.17.0.1:8090"),
+        )
+        self.assertEqual(request_public_base(req_docker, s), "http://23.106.46.111:8090")
+
+        rewritten = rewrite_media_string(
+            "http://127.0.0.1:8090/v1/media/demo.png",
+            s,
+            base_url="https://muse.example.com",
+        )
+        self.assertEqual(rewritten, "https://muse.example.com/v1/media/demo.png")

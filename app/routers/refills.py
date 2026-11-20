@@ -79,6 +79,8 @@ async def list_refills(
                 "awaiting_recovery_code",
                 "awaiting_set_password",
                 "awaiting_password_login",
+                "awaiting_card",
+                "paying",
             )
         ),
         "activated": (stats.get("activated") or 0) + (stats.get("already_activated") or 0),

@@ -9,7 +9,9 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.auth_admin import require_admin
+from app.config import get_settings
 from app.db import get_db
+from app.media_rewrite import request_public_base, rewrite_media_urls
 
 router = APIRouter(prefix="/records", tags=["records"])
 
@@ -245,9 +247,13 @@ async def list_records(
             """,
             [*args, page_size, offset],
         ).fetchall()
+    settings = get_settings()
+    base_url = request_public_base(request, settings)
     items = [_row_public(r) for r in rows]
     for it in items:
         it["status_bucket"] = _status_bucket(it.get("status"))
+        if settings.rewrite_media_urls and it.get("media_urls"):
+            it["media_urls"] = rewrite_media_urls(it["media_urls"], settings, base_url=base_url)
     return {
         "ok": True,
         "items": items,
@@ -267,8 +273,12 @@ async def get_record(record_id: int, request: Request):
         ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail={"error": "not_found"})
+    settings = get_settings()
+    base_url = request_public_base(request, settings)
     item = _row_public(row)
     item["status_bucket"] = _status_bucket(item.get("status"))
+    if settings.rewrite_media_urls and item.get("media_urls"):
+        item["media_urls"] = rewrite_media_urls(item["media_urls"], settings, base_url=base_url)
     return {"ok": True, "item": item}
 
 

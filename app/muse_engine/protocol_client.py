@@ -251,7 +251,10 @@ class HatchProtocolClient:
         self._mark("session")
         vm_id = session.get("vm_id")
         vm_state = str(session.get("vm_state") or "").upper()
-        if session.get("status") != "assigned" or not session.get("endpoint_url") or vm_state not in ("", "RUNNING"):
+        # Muse live session probes increasingly return vm_state="UNKNOWN" even for
+        # assigned standard VMs where /api/hatch/token + Noise WS connect directly.
+        connectable_states = ("", "RUNNING", "UNKNOWN")
+        if session.get("status") != "assigned" or not session.get("endpoint_url") or vm_state not in connectable_states:
             if not vm_id:
                 raise MuseGenerationError("Muse workspace is not assigned")
             # Wake is best-effort; readiness still requires a fresh session lookup.
@@ -278,7 +281,7 @@ class HatchProtocolClient:
         endpoint = session.get("endpoint_url")
         if not vm_id or not endpoint:
             raise MuseGenerationError("Muse session lacks VM connection information")
-        if vm_state and vm_state != "RUNNING":
+        if vm_state not in connectable_states:
             raise MuseGenerationError(f"Muse VM is not RUNNING (state={vm_state})")
         vm_type = str(session.get("vm_type") or "").lower()
         self._mark("token_start")

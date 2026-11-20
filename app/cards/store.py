@@ -7,8 +7,9 @@ Import format (one card per line, '|' or TAB delimited)::
 Short forms are accepted too: ``PAN|MM/YY|CVV|ZIP|US`` and
 ``PAN,MM/YY,CVV,...`` (comma only when there is no '|' in the line).
 
-Lifecycle: ``available → in_use → used`` on success, ``→ failed`` on a soft
-decline (retried later) or ``→ dead`` on a hard decline / wrong card data.
+Lifecycle: ``available → in_use → available`` on success (cards are reusable
+across signups), ``→ available`` on soft failures up to 3 consecutive failures
+(then ``→ disabled``), or ``→ dead`` on expired / hard-declined cards.
 """
 
 from __future__ import annotations
@@ -383,11 +384,10 @@ def get_card_secret(card_id: str) -> dict[str, Any]:
 
 def claim_card(item_id: str = "") -> dict[str, Any] | None:
     """Atomically pick one usable card and mark it in_use."""
-    now_g = time.gmtime()
     with get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM cards WHERE status='available' "
-            "ORDER BY fail_count ASC, created_at ASC LIMIT 200"
+            "ORDER BY fail_count ASC, COALESCE(used_at, '') ASC, updated_at ASC, created_at ASC LIMIT 200"
         ).fetchall()
         for row in rows:
             if _is_expired(int(row["exp_month"] or 0), int(row["exp_year"] or 0)):
@@ -424,7 +424,7 @@ def claim_card(item_id: str = "") -> dict[str, Any] | None:
 
 
 def claim_card_by_id(card_id: str, item_id: str = "") -> dict[str, Any] | None:
-    """Claim one explicitly chosen card (status must be available or failed)."""
+    """Claim one explicitly chosen card (status must be available, failed, or used)."""
     with get_db() as conn:
         row = conn.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
         if not row:
@@ -435,13 +435,15 @@ def claim_card_by_id(card_id: str, item_id: str = "") -> dict[str, Any] | None:
                 (_now(), card_id),
             )
             return None
-        if row["status"] not in ("available", "failed"):
+        if row["status"] not in ("available", "failed", "used"):
             return None
-        conn.execute(
+        cur = conn.execute(
             "UPDATE cards SET status='in_use', attempts=attempts+1, last_error=NULL, "
-            "used_by_item=?, updated_at=? WHERE id=?",
+            "used_by_item=?, updated_at=? WHERE id=? AND status IN ('available','failed','used')",
             (item_id or None, _now(), card_id),
         )
+        if cur.rowcount != 1:
+            return None
         secret = decrypt_dict(row["data_enc"]) or {}
     secret.update(
         {
@@ -462,6 +464,80 @@ def claim_card_by_id(card_id: str, item_id: str = "") -> dict[str, Any] | None:
     return secret
 
 
+def count_in_use(*, card_id: str | None = None) -> int:
+    with get_db() as conn:
+        if card_id:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM cards WHERE id=? AND status='in_use'",
+                (card_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM cards WHERE status='in_use'"
+            ).fetchone()
+    return int(row["c"] or 0) if row else 0
+
+
+def in_use_snapshot(*, card_id: str | None = None) -> tuple[tuple[str, int, str, str], ...]:
+    """Snapshot of currently in_use cards so queued waiters can detect forward progress."""
+    with get_db() as conn:
+        if card_id:
+            rows = conn.execute(
+                "SELECT id, attempts, COALESCE(used_by_item, '') AS used_by_item, updated_at "
+                "FROM cards WHERE id=? AND status='in_use' ORDER BY id",
+                (card_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, attempts, COALESCE(used_by_item, '') AS used_by_item, updated_at "
+                "FROM cards WHERE status='in_use' ORDER BY id"
+            ).fetchall()
+    return tuple(
+        (str(r["id"]), int(r["attempts"] or 0), str(r["used_by_item"]), str(r["updated_at"]))
+        for r in rows
+    )
+
+
+def release_if_in_use(card_id: str, item_id: str = "") -> bool:
+    """Safety net: ensure a claimed card never stays stuck in in_use."""
+    with get_db() as conn:
+        if item_id:
+            cur = conn.execute(
+                "UPDATE cards SET status='available', updated_at=? "
+                "WHERE id=? AND status='in_use' AND (used_by_item=? OR used_by_item IS NULL)",
+                (_now(), card_id, item_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE cards SET status='available', updated_at=? WHERE id=? AND status='in_use'",
+                (_now(), card_id),
+            )
+        return cur.rowcount > 0
+
+
+def recover_stale_in_use(max_age_sec: int = 0) -> int:
+    """Return stale in_use cards (e.g. after process restart or hung worker) to available."""
+    now_ts = time.time()
+    cutoff = (
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts - max_age_sec))
+        if max_age_sec > 0
+        else None
+    )
+    with get_db() as conn:
+        if cutoff is None:
+            cur = conn.execute(
+                "UPDATE cards SET status='available', updated_at=? WHERE status='in_use'",
+                (_now(),),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE cards SET status='available', updated_at=? "
+                "WHERE status='in_use' AND updated_at <= ?",
+                (_now(), cutoff),
+            )
+        return cur.rowcount
+
+
 def release_card(card_id: str, *, status: str = "available", error: str | None = None) -> None:
     if status not in STATUSES:
         status = "available"
@@ -473,11 +549,13 @@ def release_card(card_id: str, *, status: str = "available", error: str | None =
 
 
 def mark_used(card_id: str, item_id: str = "") -> None:
+    """Record a successful checkout and immediately return the card to available."""
+    now = _now()
     with get_db() as conn:
         conn.execute(
-            "UPDATE cards SET status='used', used_by_item=?, used_at=?, last_error=NULL, "
-            "updated_at=? WHERE id=?",
-            (item_id or None, _now(), _now(), card_id),
+            "UPDATE cards SET status='available', fail_count=0, used_by_item=?, used_at=?, "
+            "last_error=NULL, updated_at=? WHERE id=?",
+            (item_id or None, now, now, card_id),
         )
 
 
@@ -585,14 +663,14 @@ def set_enabled(ids: list[str], enabled: bool) -> int:
         q = ",".join("?" * len(ids))
         if enabled:
             cur = conn.execute(
-                f"UPDATE cards SET status='available', updated_at=? WHERE id IN ({q}) "
-                f"AND status IN ('disabled','failed','dead')",
+                f"UPDATE cards SET status='available', fail_count=0, updated_at=? WHERE id IN ({q}) "
+                f"AND status IN ('disabled','failed','dead','used')",
                 [_now()] + ids,
             )
         else:
             cur = conn.execute(
                 f"UPDATE cards SET status='disabled', updated_at=? WHERE id IN ({q}) "
-                f"AND status IN ('available','failed','dead')",
+                f"AND status IN ('available','failed','dead','used')",
                 [_now()] + ids,
             )
         return cur.rowcount

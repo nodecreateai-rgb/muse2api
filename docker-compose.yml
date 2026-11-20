@@ -1,0 +1,49 @@
+services:
+  muse2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+    image: muse2api:latest
+    container_name: muse2api
+    restart: unless-stopped
+    ports:
+      - ${PORT:-8090}:${PORT:-8090}
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-8090}
+      PUBLIC_BASE: ${PUBLIC_BASE:-}
+      TZ: ${TZ:-Asia/Shanghai}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///./data/muse-proxy.db}
+      ENGINE_BACKEND: ${ENGINE_BACKEND:-protocol}
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me}
+      SESSION_SECRET: ${SESSION_SECRET:-change-me-session-secret}
+      MUSE_PROXY_KEY: ${MUSE_PROXY_KEY:-}
+      PROXY_API_KEYS: ${PROXY_API_KEYS:-}
+      SIGNUP_CREDENTIALS_KEY: ${SIGNUP_CREDENTIALS_KEY:-}
+      SIGNUP_CLIENT: ${SIGNUP_CLIENT:-http}
+      SIGNUP_MUSE_BASE: ${SIGNUP_MUSE_BASE:-https://muse.ai}
+      CHECKOUT_ENABLED: ${CHECKOUT_ENABLED:-true}
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-8}
+      MEDIA_AUTH_REQUIRED: ${MEDIA_AUTH_REQUIRED:-true}
+      REWRITE_MEDIA_URLS: ${REWRITE_MEDIA_URLS:-true}
+    volumes:
+      # SQLite database (accounts, cards, settings, logs) + generated media files.
+      - muse2api-data:/app/data
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT:-8090}/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  muse2api-data:
+    name: muse2api-data

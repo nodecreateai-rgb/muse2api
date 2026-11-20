@@ -57,8 +57,10 @@ app.include_router(r2.router, prefix="/api")
 @app.on_event("startup")
 async def _startup_keepalive() -> None:
     from app import jobs_keepalive
+    from app.cards import store as cards_store
     from app.signup import scheduler as signup_scheduler
 
+    cards_store.recover_stale_in_use(max_age_sec=0)
     jobs_keepalive.ensure_scheduler()
     signup_scheduler.ensure_scheduler()
 

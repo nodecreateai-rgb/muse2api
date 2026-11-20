@@ -103,7 +103,7 @@ async def main() -> int:
     item = store.get_item(iid) or {}
     check("signup pooled", item.get("status") == "pooled", f"status={item.get('status')} out={out}")
     used = [c for c in cards.list_cards(page=1, page_size=200)["items"] if c["used_by_item"] == iid]
-    check("one card marked used", len(used) == 1 and used[0]["status"] == "used",
+    check("one card used and returned to available", len(used) == 1 and used[0]["status"] == "available",
           used[0]["masked"] if used else "-")
     logs = [r for r in store.list_logs(after=0, limit=500) if r["item_id"] == iid]
     joined = " | ".join(r["message"] for r in logs)
@@ -133,9 +133,12 @@ async def main() -> int:
     item2 = store.get_item(iid2) or {}
     check("item awaits card after decline", item2.get("status") == "awaiting_card",
           f"status={item2.get('status')}")
-    dead = [c for c in cards.list_cards(page=1, page_size=200)["items"] if c["last4"] == "0000"]
-    check("declined card marked dead", bool(dead) and dead[0]["status"] == "dead",
-          dead[0]["status"] if dead else "-")
+    declined = [c for c in cards.list_cards(page=1, page_size=200)["items"] if c["last4"] == "0000"]
+    check(
+        "declined card counted failures and stays reusable below threshold",
+        bool(declined) and declined[0]["status"] == "available" and declined[0]["fail_count"] == 2,
+        f"status={declined[0]['status']} fails={declined[0]['fail_count']}" if declined else "-",
+    )
 
     print("\n== 4. empty pool ==")
     cards.delete_cards([c["id"] for c in cards.list_cards(page=1, page_size=200)["items"]])

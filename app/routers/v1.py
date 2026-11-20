@@ -22,7 +22,7 @@ from app.auth_api import (
 )
 from app.call_log import write_call_log
 from app.config import get_settings
-from app.media_rewrite import is_safe_media_name
+from app.media_rewrite import is_safe_media_name, request_public_base
 
 router = APIRouter(prefix="/v1", tags=["v1"])
 
@@ -192,6 +192,7 @@ async def images_generations(
         )
         timeout = body.get("timeout")
         async_mode = bool(body.get("async") or body.get("async_"))
+        base_url = request_public_base(request)
         if async_mode:
             resp = queue_image_task(
                 prompt=prompt,
@@ -200,6 +201,7 @@ async def images_generations(
                 size=body.get("size"),
                 response_format=body.get("response_format") or "url",
                 timeout=int(timeout) if timeout else None,
+                base_url=base_url,
             )
             write_call_log(
                 path="/v1/images/generations",
@@ -233,6 +235,7 @@ async def images_generations(
             res,
             size=body.get("size"),
             response_format=body.get("response_format") or "url",
+            base_url=base_url,
         )
         media = [out["data"][0].get("url")] if out.get("data") else []
         write_call_log(
@@ -352,6 +355,7 @@ async def images_edits(
             kinds=kinds,
             ref_count=len(refs),
         )
+        base_url = request_public_base(request)
         if async_mode:
             resp = queue_image_task(
                 prompt=prompt,
@@ -360,6 +364,7 @@ async def images_edits(
                 size=size,
                 response_format=response_format,
                 timeout=int(timeout) if timeout else None,
+                base_url=base_url,
             )
             write_call_log(
                 path="/v1/images/edits",
@@ -389,7 +394,9 @@ async def images_edits(
             acc_label = _row.get("label") or ""
         except Exception:
             acc_label = ""
-        out = image_response(prompt, res, size=size, response_format=response_format)
+        out = image_response(
+            prompt, res, size=size, response_format=response_format, base_url=base_url
+        )
         write_call_log(
             path="/v1/images/edits",
             method="POST",
@@ -465,6 +472,7 @@ async def images_tasks_create(
             response_format=body.get("response_format") or "url",
             timeout=int(body["timeout"]) if body.get("timeout") else None,
             idempotency_key=idempotency_key,
+            base_url=request_public_base(request),
         )
         write_call_log(
             path="/v1/images/tasks",
@@ -505,7 +513,7 @@ async def images_tasks_get(
 ):
     from app.muse_engine.service import get_image_task_view
 
-    out = get_image_task_view(task_id)
+    out = get_image_task_view(task_id, base_url=request_public_base(request))
     if not out:
         raise openai_http_error(404, "image task 不存在", code="not_found")
     return out
@@ -546,6 +554,7 @@ async def videos_create(
             api_prompt=api_prompt,
             reference_images=refs,
             timeout=int(body["timeout"]) if body.get("timeout") else None,
+            base_url=request_public_base(request),
         )
         write_call_log(
             path="/v1/videos",
@@ -587,7 +596,7 @@ async def videos_get(
 ):
     from app.muse_engine.service import get_video_task_view
 
-    out = get_video_task_view(video_id)
+    out = get_video_task_view(video_id, base_url=request_public_base(request))
     if not out:
         raise openai_http_error(404, "task 不存在", code="not_found")
     return out
