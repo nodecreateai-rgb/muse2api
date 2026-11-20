@@ -10,13 +10,13 @@ services:
     container_name: muse2api
     restart: unless-stopped
     ports:
-      - ${PORT:-8090}:${PORT:-8090}
+      - ${PORT:-43919}:${PORT:-43919}
     env_file:
       - path: .env
         required: false
     environment:
       HOST: ${HOST:-0.0.0.0}
-      PORT: ${PORT:-8090}
+      PORT: ${PORT:-43919}
       PUBLIC_BASE: ${PUBLIC_BASE:-}
       TZ: ${TZ:-Asia/Shanghai}
       DATABASE_URL: ${DATABASE_URL:-sqlite:///./data/muse-proxy.db}
@@ -38,7 +38,7 @@ services:
       - muse2api-data:/app/data
     stop_grace_period: 30s
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT:-8090}/healthz || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT:-43919}/healthz || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

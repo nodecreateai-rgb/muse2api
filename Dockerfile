@@ -15,7 +15,7 @@ ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
-    PORT=8090 \
+    PORT=43919 \
     DATABASE_URL=sqlite:///./data/muse-proxy.db \
     ENGINE_BACKEND=protocol
 
@@ -32,9 +32,9 @@ COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh \
     && mkdir -p /app/data /app/data/media /app/data/downloads /app/data/profiles
 
-EXPOSE 8090
+EXPOSE 43919
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${PORT:-8090}/healthz" || exit 1
+  CMD curl -fsS "http://127.0.0.1:${PORT:-43919}/healthz" || exit 1
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
