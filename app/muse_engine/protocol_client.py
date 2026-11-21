@@ -14,6 +14,7 @@ import mimetypes
 import posixpath
 import re
 import secrets
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -202,6 +203,48 @@ class Response:
 class HatchProtocolClient:
     """Noise transport client. May be pooled per account; send path is lock-serialised."""
 
+    _session_cache: dict[str, tuple[float, dict]] = {}
+    _session_cache_guard = threading.Lock()
+
+    @classmethod
+    def _session_cache_key(cls, cookies: dict[str, str], proxy: dict | None) -> str:
+        c_part = "|".join(f"{k}={str(v)[:16]}" for k, v in sorted((cookies or {}).items()) if v)
+        p_part = ""
+        if proxy:
+            p_part = f"{proxy.get('server') or ''}|{proxy.get('username') or ''}"
+        return hashlib.sha256(f"{c_part}::{p_part}".encode()).hexdigest()
+
+    @classmethod
+    def remember_session(
+        cls,
+        cookies: dict[str, str],
+        session: dict | None,
+        *,
+        proxy: dict | None = None,
+        ttl: float = 20.0,
+    ) -> None:
+        """Cache a fresh /api/session payload briefly to avoid duplicate roundtrips on connect()."""
+        if not isinstance(session, dict) or not cookies:
+            return
+        key = cls._session_cache_key(cookies, normalize_proxy_dict(proxy))
+        now = time.monotonic()
+        with cls._session_cache_guard:
+            # Prune expired entries boundedly
+            for k in [k for k, (exp, _) in cls._session_cache.items() if exp <= now]:
+                cls._session_cache.pop(k, None)
+            cls._session_cache[key] = (now + max(1.0, float(ttl)), dict(session))
+
+    @classmethod
+    def _pop_remembered_session(cls, cookies: dict[str, str], proxy: dict | None) -> dict | None:
+        key = cls._session_cache_key(cookies, proxy)
+        now = time.monotonic()
+        with cls._session_cache_guard:
+            entry = cls._session_cache.pop(key, None)
+        if not entry:
+            return None
+        exp, session = entry
+        return dict(session) if exp > now else None
+
     def __init__(self, cookies: dict[str, str], *, proxy: dict | None = None):
         self.cookies = dict(cookies)
         self.proxy = normalize_proxy_dict(proxy)
@@ -289,36 +332,58 @@ class HatchProtocolClient:
         return value
 
     async def connect(self) -> None:
-        self._mark("session_start")
-        session = self._http("GET", "https://muse.ai/api/session?vm_state=live")
-        self._mark("session")
-        vm_id = session.get("vm_id")
-        vm_state = str(session.get("vm_state") or "").upper()
-        # Muse live session probes increasingly return vm_state="UNKNOWN" even for
-        # assigned standard VMs where /api/hatch/token + Noise WS connect directly.
         connectable_states = ("", "RUNNING", "UNKNOWN")
-        if session.get("status") != "assigned" or not session.get("endpoint_url") or vm_state not in connectable_states:
-            if not vm_id:
-                raise MuseGenerationError("Muse workspace is not assigned")
-            # Wake is best-effort; readiness still requires a fresh session lookup.
-            try:
-                self._mark("wake_start")
-                self._http(
-                    "POST",
-                    "https://muse.ai/api/hatch/vm/wake",
-                    {
-                        "vm_id": vm_id,
-                        "retry_count": 0,
-                        "connect_attempt_id": str(uuid.uuid4()),
-                    },
-                )
-                self._mark("wake")
-            except MuseGenerationError:
-                pass
-            session = self._http("GET", "https://muse.ai/api/session?vm_state=live")
+
+        def _fetch_live_session() -> tuple[dict, str | None, str]:
+            self._mark("session_start")
+            sess = self._http("GET", "https://muse.ai/api/session?vm_state=live")
             self._mark("session")
+            v_id = sess.get("vm_id")
+            v_state = str(sess.get("vm_state") or "").upper()
+            # Muse live session probes increasingly return vm_state="UNKNOWN" even for
+            # assigned standard VMs where /api/hatch/token + Noise WS connect directly.
+            if sess.get("status") != "assigned" or not sess.get("endpoint_url") or v_state not in connectable_states:
+                if not v_id:
+                    raise MuseGenerationError("Muse workspace is not assigned")
+                # Wake is best-effort; readiness still requires a fresh session lookup.
+                try:
+                    self._mark("wake_start")
+                    self._http(
+                        "POST",
+                        "https://muse.ai/api/hatch/vm/wake",
+                        {
+                            "vm_id": v_id,
+                            "retry_count": 0,
+                            "connect_attempt_id": str(uuid.uuid4()),
+                        },
+                    )
+                    self._mark("wake")
+                except MuseGenerationError:
+                    pass
+                sess = self._http("GET", "https://muse.ai/api/session?vm_state=live")
+                self._mark("session")
+                v_id = sess.get("vm_id")
+                v_state = str(sess.get("vm_state") or "").upper()
+            return sess, v_id, v_state
+
+        cached = self._pop_remembered_session(self.cookies, self.proxy)
+        used_cached = False
+        if (
+            cached
+            and cached.get("status") == "assigned"
+            and cached.get("endpoint_url")
+            and str(cached.get("vm_state") or "").upper() in connectable_states
+        ):
+            session = cached
             vm_id = session.get("vm_id")
             vm_state = str(session.get("vm_state") or "").upper()
+            now_mark = time.perf_counter()
+            self.timings.setdefault("session_start", now_mark)
+            self.timings.setdefault("session", now_mark)
+            used_cached = True
+        else:
+            session, vm_id, vm_state = _fetch_live_session()
+
         if session.get("status") != "assigned":
             raise MuseGenerationError("Muse workspace is not assigned")
         endpoint = session.get("endpoint_url")
@@ -328,10 +393,29 @@ class HatchProtocolClient:
             raise MuseGenerationError(f"Muse VM is not RUNNING (state={vm_state})")
         vm_type = str(session.get("vm_type") or "").lower()
         self._mark("token_start")
-        token = self._http(
-            "POST", "https://muse.ai/api/hatch/token",
-            {"vmAddress": endpoint, **({"vmName": session["vm_name"]} if session.get("vm_name") else {})},
-        )
+        try:
+            token = self._http(
+                "POST", "https://muse.ai/api/hatch/token",
+                {"vmAddress": endpoint, **({"vmName": session["vm_name"]} if session.get("vm_name") else {})},
+            )
+        except MuseGenerationError:
+            if not used_cached:
+                raise
+            # Cached session may have gone stale; re-fetch live session + wake once.
+            session, vm_id, vm_state = _fetch_live_session()
+            if session.get("status") != "assigned":
+                raise MuseGenerationError("Muse workspace is not assigned")
+            endpoint = session.get("endpoint_url")
+            if not vm_id or not endpoint:
+                raise MuseGenerationError("Muse session lacks VM connection information")
+            if vm_state not in connectable_states:
+                raise MuseGenerationError(f"Muse VM is not RUNNING (state={vm_state})")
+            vm_type = str(session.get("vm_type") or "").lower()
+            self._mark("token_start")
+            token = self._http(
+                "POST", "https://muse.ai/api/hatch/token",
+                {"vmAddress": endpoint, **({"vmName": session["vm_name"]} if session.get("vm_name") else {})},
+            )
         auth_token = token.get("token")
         self._mark("token")
         if not auth_token:

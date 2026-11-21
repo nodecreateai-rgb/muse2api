@@ -737,50 +737,99 @@ class ProtocolEngine:
         timeline: list | None = None,
         use_pool: bool = True,
     ) -> Iterator[str]:
+        import queue as _queue
+
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         timeline = timeline if timeline is not None else []
-        with self._account_lock(account_id, parallel_ok=parallel_ok, expect=None):
-            async def collect():
-                emitted = []
-                result_meta = {}
-                async for event in self._stream(
-                    cookies,
-                    prompt,
-                    expect=None,
-                    timeout=timeout,
-                    reference_images=None,
-                    proxy=proxy,
-                    account_id=account_id,
-                    use_pool=use_pool and bool(account_id),
-                    marker=marker,
-                    timeline=timeline,
-                ):
-                    if event.get("type") == "text":
-                        emitted.append(event["text"])
-                    elif event.get("type") == "result":
-                        result_meta = event
-                        if event.get("text") and not emitted:
-                            emitted.append(event["text"])
-                return emitted, result_meta
+        pooled = bool(account_id and use_pool)
 
+        with self._account_lock(account_id, parallel_ok=parallel_ok, expect=None):
+            delta_q: _queue.SimpleQueue[tuple[str, Any]] = _queue.SimpleQueue()
+
+            async def produce() -> None:
+                emitted_any = False
+                result_meta: dict[str, Any] = {}
+                err: BaseException | None = None
+                try:
+                    async for event in self._stream(
+                        cookies,
+                        prompt,
+                        expect=None,
+                        timeout=timeout,
+                        reference_images=None,
+                        proxy=proxy,
+                        account_id=account_id,
+                        use_pool=pooled,
+                        marker=marker,
+                        timeline=timeline,
+                    ):
+                        if event.get("type") == "text":
+                            txt = str(event.get("text") or "")
+                            if txt:
+                                emitted_any = True
+                                delta_q.put(("delta", txt))
+                        elif event.get("type") == "result":
+                            result_meta = event
+                            if event.get("text") and not emitted_any:
+                                emitted_any = True
+                                delta_q.put(("delta", str(event["text"])))
+                except BaseException as exc:  # noqa: BLE001
+                    err = exc
+                finally:
+                    delta_q.put(("done", (result_meta, err)))
+
+            fut = None
+            runner_thread = None
+            if pooled:
+                from app.muse_engine.protocol_pool import get_worker
+
+                worker = get_worker(str(account_id))
+                if worker._closed:
+                    raise MuseGenerationError("protocol worker is closed")
+                fut = asyncio.run_coroutine_threadsafe(produce(), worker.loop)
+            else:
+                def _run_unpooled() -> None:
+                    asyncio.run(produce())
+
+                runner_thread = threading.Thread(target=_run_unpooled, daemon=True)
+                runner_thread.start()
+
+            deadline = time.monotonic() + timeout + 60
+            meta: dict[str, Any] = {}
+            err: BaseException | None = None
             try:
-                if account_id and use_pool:
-                    from app.muse_engine.protocol_pool import get_worker
-                    texts, meta = get_worker(str(account_id)).call(collect(), timeout=timeout + 60)
-                else:
-                    texts, meta = asyncio.run(collect())
-            except (MuseAuthError, MuseProxyError, MuseGenerationError):
-                raise
-            except Exception as exc:
-                if is_noise_disconnect_error(exc):
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise MuseGenerationError("纯协议上游请求超时")
+                    try:
+                        kind, payload = delta_q.get(timeout=min(remaining, 1.0))
+                    except _queue.Empty:
+                        if fut is not None and fut.done():
+                            err = fut.exception()
+                            break
+                        continue
+                    if kind == "delta":
+                        yield payload
+                    elif kind == "done":
+                        meta, err = payload
+                        break
+            finally:
+                if err is None and meta.get("timings") is not None:
+                    timeline.append({"timings_ms": timing_deltas(meta.get("timings") or {})})
+                if fut is not None and not fut.done():
+                    fut.cancel()
+                if runner_thread is not None:
+                    runner_thread.join(timeout=2)
+
+            if err is not None:
+                if isinstance(err, (MuseAuthError, MuseProxyError, MuseGenerationError)):
+                    raise err
+                if is_noise_disconnect_error(err):
                     raise MuseNoiseClosedError(
-                        f"Noise 连接已断开 ({type(exc).__name__}: {exc})"
+                        f"Noise 连接已断开 ({type(err).__name__}: {err})"
                     ) from None
-                raise MuseGenerationError(f"纯协议对话失败 ({type(exc).__name__})") from None
-            if meta.get("timings") is not None:
-                timeline.append({"timings_ms": timing_deltas(meta.get("timings") or {})})
-            for text in texts:
-                yield text
+                raise MuseGenerationError(f"纯协议对话失败 ({type(err).__name__})") from None
 
     def generate(
         self,

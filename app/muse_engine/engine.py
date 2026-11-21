@@ -540,7 +540,7 @@ class MuseEngine:
         以响应真实 Set-Cookie 为准（hatch_vml Max-Age=172800 ≈2 天，hatch_sess 2592000 ≈30 天），
         本地绝不虚构更长有效期；按需 /api/hatch/vm/wake 唤醒工作区 VM。"""
         import requests
-        with request_proxy_context(proxy) as proxy_options:
+        with request_proxy_context(proxy) as proxy_options, requests.Session() as http_session:
             cur_cookies = dict(cookies or {})
             cur_exp = dict(expires or {})
             headers = {
@@ -553,8 +553,8 @@ class MuseEngine:
                 "Cookie": "; ".join(f"{k}={v}" for k, v in cur_cookies.items() if v),
             }
             try:
-                r = requests.get("https://muse.ai/api/session?vm_state=live", headers=headers,
-                                 timeout=12, allow_redirects=False, **proxy_options)
+                r = http_session.get("https://muse.ai/api/session?vm_state=live", headers=headers,
+                                     timeout=12, allow_redirects=False, **proxy_options)
             except requests.RequestException as exc:
                 # 不回显请求内容：异常可能包含带凭据的代理 URL。
                 if proxy:
@@ -612,7 +612,7 @@ class MuseEngine:
                         f"{k}={v}" for k, v in cur_cookies.items() if v
                     )
                     headers["Content-Type"] = "application/json"
-                    leased = requests.post(
+                    leased = http_session.post(
                         "https://muse.ai/api/hatch/lease-vm",
                         headers=headers,
                         json={"vmType": "standard"},
@@ -629,7 +629,7 @@ class MuseEngine:
                         headers["Cookie"] = "; ".join(
                             f"{k}={v}" for k, v in cur_cookies.items() if v
                         )
-                        again = requests.get(
+                        again = http_session.get(
                             "https://muse.ai/api/session?vm_state=live",
                             headers=headers,
                             timeout=12,
@@ -661,12 +661,13 @@ class MuseEngine:
             if not assigned and not require_assigned and wake_vm:
                 wake_vm = False
             vm_state = sj.get("vm_state")
-            wake_ok = False
+            vm_state_u = str(vm_state or "").upper()
+            wake_ok = vm_state_u == "RUNNING" and bool(sj.get("endpoint_url"))
             wake_requested = False
-            if wake_vm and assigned and vm_id and vm_state != "DISABLED":
+            if wake_vm and assigned and vm_id and vm_state_u != "DISABLED" and not wake_ok:
                 try:
                     headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cur_cookies.items() if v)
-                    rw = requests.post("https://muse.ai/api/hatch/vm/wake", headers=headers, json={
+                    rw = http_session.post("https://muse.ai/api/hatch/vm/wake", headers=headers, json={
                         "vm_id": vm_id,
                         "retry_count": 0,
                         "connect_attempt_id": str(uuid.uuid4()),
@@ -676,15 +677,16 @@ class MuseEngine:
                     wake_requested = rw.status_code == 200
                     if wake_requested:
                         # HTTP 200 acknowledges the request; only session state confirms the VM woke.
-                        verify = requests.get("https://muse.ai/api/session", headers=headers,
-                                              timeout=12, allow_redirects=False, **proxy_options)
+                        verify = http_session.get("https://muse.ai/api/session", headers=headers,
+                                                  timeout=12, allow_redirects=False, **proxy_options)
                         if proxy and verify.status_code == 407:
                             raise MuseProxyError("账号代理认证失败 (HTTP 407)，未完成 VM 状态确认")
                         if verify.status_code == 200:
                             verified_session = verify.json()
                             if isinstance(verified_session, dict) and verified_session.get("status") == "assigned":
+                                sj = verified_session
                                 vm_state = verified_session.get("vm_state") or vm_state
-                                wake_ok = vm_state == "RUNNING"
+                                wake_ok = str(vm_state or "").upper() == "RUNNING"
                 except MuseProxyError:
                     raise
                 except requests.RequestException as exc:
@@ -704,6 +706,7 @@ class MuseEngine:
                 "vm_state": vm_state,
                 "wake_ok": wake_ok,
                 "wake_requested": wake_requested,
+                "session": sj,
                 "cookies": cur_cookies,
                 "cookies_exp": cur_exp,
             }

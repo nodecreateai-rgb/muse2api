@@ -241,9 +241,10 @@ def _renew_if_needed(
         except Exception:
             pass
     proxy = _account_proxy(acc)
+    protocol_mode = engine_backend() == "protocol"
     try:
         result = MuseEngine.renew_session_http(
-            cookies, expires, wake_vm=True, proxy=proxy
+            cookies, expires, wake_vm=not protocol_mode, proxy=proxy
         )
     except MuseAuthError:
         pool_store.update(str(acc["id"]), ok=False, checked=True)
@@ -258,6 +259,13 @@ def _renew_if_needed(
         raise MuseGenerationError(
             result.get("message") or "登录态有效，但工作区尚未分配（等 VM 供货）"
         )
+    if protocol_mode and isinstance(result.get("session"), dict):
+        try:
+            from app.muse_engine.protocol_client import HatchProtocolClient
+
+            HatchProtocolClient.remember_session(new_cookies, result["session"], proxy=proxy)
+        except Exception:
+            pass
     return new_cookies, new_exp
 
 
@@ -450,10 +458,10 @@ async def stream_text_sse(
         try:
             for d in _sync_chat_stream(prompt, timeout=timeout, timing=timing):
                 parts.append(d)
-                asyncio.run_coroutine_threadsafe(queue.put(("delta", d)), loop).result()
-            asyncio.run_coroutine_threadsafe(queue.put(("done", "".join(parts))), loop).result()
+                loop.call_soon_threadsafe(queue.put_nowait, ("delta", d))
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", "".join(parts)))
         except Exception as exc:  # noqa: BLE001
-            asyncio.run_coroutine_threadsafe(queue.put(("error", str(exc))), loop).result()
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
 
     threading.Thread(target=_producer, daemon=True).start()
 

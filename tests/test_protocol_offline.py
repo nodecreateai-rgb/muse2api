@@ -697,6 +697,131 @@ class StreamIsolationTests(unittest.TestCase):
             got_fallback = "".join(eng.chat_stream({"hatch_sess": "h"}, "hi", use_pool=False))
         self.assertEqual(got_fallback, "hello world")
 
+    def test_chat_stream_yields_incrementally_before_message_done_and_session_cache_reused(self):
+        import asyncio
+        import json
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from app.muse_engine.config import EngineConfig
+        from app.muse_engine.engine import MuseGenerationError
+        from app.muse_engine.protocol_client import HatchProtocolClient
+        from app.muse_engine.protocol_engine import ProtocolEngine
+
+        # 1) remember_session avoids duplicate GET /api/session inside connect(),
+        #    and falls back to live GET /api/session if token fails once.
+        cookies = {"hatch_sess": "cache-test-cookie"}
+        HatchProtocolClient.remember_session(
+            cookies,
+            {
+                "status": "assigned",
+                "vm_id": "vm-cached",
+                "vm_name": "vm-cached",
+                "endpoint_url": "wss://cached.example.test/",
+                "vm_state": "RUNNING",
+                "vm_type": "hatch_vm",
+            },
+        )
+        c1 = HatchProtocolClient(cookies)
+        calls1 = []
+
+        def fake_http_cached(method, url, body=None):
+            calls1.append((method, url))
+            if "api/hatch/token" in url:
+                raise MuseGenerationError("stop_after_cached_token")
+            raise AssertionError(f"unexpected extra call {method} {url}")
+
+        # Case A: token works directly without GET /api/session; here verify it went straight
+        # to /api/hatch/token first (using cached session), then fell back cleanly to live GET /api/session!
+        c1._http = fake_http_cached  # type: ignore[method-assign]
+        with self.assertRaises(AssertionError):
+            # Fallback after token failure attempts live GET /api/session, which our assertion catches!
+            asyncio.run(c1.connect())
+        self.assertEqual(calls1[0][1], "https://muse.ai/api/hatch/token")
+        self.assertEqual(calls1[1][1], "https://muse.ai/api/session?vm_state=live")
+
+        # 2) chat_stream yields first delta immediately before delta.message_done arrives.
+        release_done = threading.Event()
+
+        class StreamingFakeClient:
+            def __init__(self, *a, **kw):
+                self.node_id = "node-rt-1"
+                self.timings = {}
+                self.responses = {1: SimpleNamespace(body=bytearray())}
+
+            def _mark(self, name):
+                self.timings[name] = 1.0
+
+            async def connect(self):
+                return None
+
+            async def subscribe(self):
+                return 1, {"status": "ok", "payload": {"capabilities": []}}
+
+            async def request(self, method, path, body, timeout):
+                evs = [
+                    {
+                        "event": "delta.message_start",
+                        "seq": 1,
+                        "payload": {
+                            "chat_context": {"device_id": self.node_id},
+                            "message_id": "assistant-msg-rt",
+                        },
+                    },
+                    {
+                        "event": "delta.text_append",
+                        "seq": 2,
+                        "payload": {
+                            "message_id": "assistant-msg-rt",
+                            "text": "first-chunk",
+                        },
+                    },
+                ]
+                self.responses[1].body.extend(
+                    "".join(json.dumps(e) + "\n" for e in evs).encode()
+                )
+
+                def push_done_later():
+                    release_done.wait(timeout=3.0)
+                    done_ev = {
+                        "event": "delta.message_done",
+                        "seq": 3,
+                        "payload": {
+                            "chat_context": {"device_id": self.node_id},
+                            "message_id": "assistant-msg-rt",
+                            "status": "completed",
+                            "transcript": {
+                                "messages": [
+                                    {
+                                        "id": "assistant-msg-rt",
+                                        "role": "assistant",
+                                        "content": [{"type": "text", "text": "first-chunk"}],
+                                    }
+                                ]
+                            },
+                        },
+                    }
+                    self.responses[1].body.extend((json.dumps(done_ev) + "\n").encode())
+
+                threading.Thread(target=push_done_later, daemon=True).start()
+                return SimpleNamespace(status=200, json=lambda: {"message_id": "u1"})
+
+            async def wait_update(self, sub_id, timeout):
+                await asyncio.sleep(0.01)
+
+            async def close(self):
+                return None
+
+        eng = ProtocolEngine(EngineConfig())
+        with patch("app.muse_engine.protocol_engine.HatchProtocolClient", StreamingFakeClient):
+            gen = eng.chat_stream(cookies, "stream rt", use_pool=False)
+            first = next(gen)
+            # We got the first chunk BEFORE releasing delta.message_done!
+            self.assertEqual(first, "first-chunk")
+            release_done.set()
+            rest = list(gen)
+        self.assertEqual(rest, [])
+
 
 class NoiseDisconnectRecoveryTests(unittest.TestCase):
     def test_client_liveness_and_send_disconnect_conversion(self):
