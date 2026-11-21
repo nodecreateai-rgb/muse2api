@@ -580,3 +580,207 @@ class StreamIsolationTests(unittest.TestCase):
         finally:
             worker.client = None
             worker.shutdown()
+
+
+class NoiseDisconnectRecoveryTests(unittest.TestCase):
+    def test_client_liveness_and_send_disconnect_conversion(self):
+        import asyncio
+        from types import SimpleNamespace
+        from websockets.exceptions import ConnectionClosedError
+        from websockets.protocol import State
+        from app.muse_engine.engine import MuseGenerationError
+        from app.muse_engine.protocol_client import (
+            HatchProtocolClient,
+            MuseNoiseClosedError,
+            Cipher,
+        )
+
+        client = HatchProtocolClient({"hatch_sess": "h"})
+        client.send_cipher = Cipher(b"\x01" * 32)
+        client.ws = SimpleNamespace(
+            state=State.OPEN,
+            close_code=None,
+            closed=False,
+        )
+        self.assertTrue(client.is_alive())
+
+        # Closed state or close_code marks client dead immediately.
+        client.ws.state = State.CLOSED
+        self.assertFalse(client.is_alive())
+        client.ws.state = State.OPEN
+        client.ws.close_code = 1006
+        self.assertFalse(client.is_alive())
+
+        # When ws.send raises ConnectionClosedError("no close frame received or sent"),
+        # send_request must convert it into MuseNoiseClosedError (MuseGenerationError) and mark dead.
+        async def run_send_disconnect():
+            async def boom(_data):
+                raise ConnectionClosedError(None, None)
+
+            client.ws = SimpleNamespace(
+                state=State.OPEN,
+                close_code=None,
+                closed=False,
+                send=boom,
+            )
+            client.closing = False
+            client._closed_error = None
+            with self.assertRaises(MuseNoiseClosedError) as ctx:
+                await client.send_request("POST", "/chat/stream", {"items": []})
+            self.assertIsInstance(ctx.exception, MuseGenerationError)
+            self.assertIn("no close frame received or sent", str(ctx.exception))
+            self.assertFalse(client.is_alive())
+            with self.assertRaises(MuseNoiseClosedError):
+                await client.wait_update(1, 0.2)
+
+        asyncio.run(run_send_disconnect())
+
+    def test_pool_dead_worker_not_warm_and_chat_stream_recovers(self):
+        import asyncio
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from websockets.exceptions import ConnectionClosedError
+        from websockets.protocol import State
+        from app.muse_engine.config import EngineConfig
+        from app.muse_engine.engine import MuseGenerationError
+        from app.muse_engine.protocol_client import Cipher, Response, MuseNoiseClosedError
+        from app.muse_engine.protocol_engine import ProtocolEngine
+        from app.muse_engine.protocol_pool import (
+            AccountNoiseWorker,
+            _HUB_GUARD,
+            _WORKERS,
+            drop_worker,
+            has_warm_worker,
+        )
+
+        acc_id = "test-noise-recover-acc"
+        drop_worker(acc_id)
+
+        class FakePooledClient:
+            instances: list["FakePooledClient"] = []
+
+            def __init__(self, cookies, *, proxy=None):
+                self.cookies = cookies
+                self.proxy = proxy
+                self.ws = SimpleNamespace(state=State.OPEN, close_code=None, closed=False)
+                self.closing = False
+                self._closed_error = None
+                self.timings = {}
+                self.node_id = "node-init"
+                self.responses = {1: Response(status=200, body=bytearray())}
+                self.waiters = {}
+                self.receiver_task = None
+                self.heartbeat_task = None
+                self.send_cipher = Cipher(b"\x02" * 32)
+                self.reqs = []
+                FakePooledClient.instances.append(self)
+
+            def is_alive(self):
+                return (
+                    self.ws is not None
+                    and not self.closing
+                    and getattr(self.ws, "close_code", None) is None
+                    and getattr(self.ws, "state", State.OPEN) == State.OPEN
+                )
+
+            def _mark(self, name):
+                self.timings[name] = 1.0
+
+            def reset_timings(self):
+                self.timings = {}
+
+            def new_task_node(self):
+                self.node_id = f"node-{len(self.reqs) + 1}"
+                return self.node_id
+
+            async def connect(self):
+                return None
+
+            async def subscribe(self):
+                return 1, {"status": "ok", "payload": {"capabilities": []}}
+
+            async def wait_update(self, stream_id, timeout=30):
+                if self.closing:
+                    raise MuseNoiseClosedError("Noise connection closed")
+                await asyncio.sleep(min(timeout, 0.02))
+
+            async def request(self, method, path, body=None, timeout=40):
+                self.reqs.append((method, path, len(FakePooledClient.instances)))
+                # First instance simulates stale reused WS dropping on second request!
+                if len(FakePooledClient.instances) == 1 and len(self.reqs) >= 2:
+                    self.closing = True
+                    raise ConnectionClosedError(None, None)
+                node_id = (body or {}).get("node_id") or self.node_id
+                ev1 = json.dumps({
+                    "event": "delta.text_append",
+                    "seq": 100 + len(self.reqs),
+                    "payload": {"text": f"ok-conn-{len(FakePooledClient.instances)}", "chat_context": {"device_id": node_id}},
+                })
+                ev2 = json.dumps({
+                    "event": "delta.message_done",
+                    "seq": 200 + len(self.reqs),
+                    "payload": {"status": "completed", "chat_context": {"device_id": node_id}},
+                })
+                self.responses[1].body.extend((ev1 + "\n" + ev2 + "\n").encode())
+                return Response(status=200, body=bytearray(b"{}"), ended=True)
+
+            async def close(self):
+                self.closing = True
+                self.ws = None
+
+        eng = ProtocolEngine(EngineConfig())
+        try:
+            with patch("app.muse_engine.protocol_pool.HatchProtocolClient", FakePooledClient):
+                # 1) Initial pooled call warms connection #1
+                out1 = "".join(
+                    eng.chat_stream(
+                        {"hatch_sess": "h1"},
+                        "hello 1",
+                        account_id=acc_id,
+                        use_pool=True,
+                    )
+                )
+                self.assertEqual(out1, "ok-conn-1")
+                self.assertTrue(has_warm_worker(acc_id))
+
+                # 2) Second pooled call hits reuse_hit on conn #1, gets ConnectionClosedError
+                # ("no close frame received or sent"), invalidates conn #1, reconnects conn #2,
+                # and succeeds transparently!
+                out2 = "".join(
+                    eng.chat_stream(
+                        {"hatch_sess": "h1"},
+                        "hello 2",
+                        account_id=acc_id,
+                        use_pool=True,
+                    )
+                )
+                self.assertEqual(out2, "ok-conn-2")
+                self.assertEqual(len(FakePooledClient.instances), 2)
+                self.assertTrue(has_warm_worker(acc_id))
+
+                # 3) If underlying socket dies while idle, has_warm_worker immediately reports False.
+                FakePooledClient.instances[-1].ws.close_code = 1006
+                self.assertFalse(has_warm_worker(acc_id))
+
+                # 4) If every connection drops with ConnectionClosedError("no close frame received or sent"),
+                # chat_stream raises MuseNoiseClosedError (MuseGenerationError), never raw ConnectionClosedError.
+                class AlwaysDropClient(FakePooledClient):
+                    async def request(self, method, path, body=None, timeout=40):
+                        raise ConnectionClosedError(None, None)
+
+                drop_worker(acc_id)
+                with patch("app.muse_engine.protocol_pool.HatchProtocolClient", AlwaysDropClient):
+                    with self.assertRaises(MuseNoiseClosedError) as ctx:
+                        list(
+                            eng.chat_stream(
+                                {"hatch_sess": "h1"},
+                                "hello 3",
+                                account_id=acc_id,
+                                use_pool=True,
+                            )
+                        )
+                    self.assertIsInstance(ctx.exception, MuseGenerationError)
+                    self.assertFalse(has_warm_worker(acc_id))
+        finally:
+            drop_worker(acc_id)

@@ -16,11 +16,17 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.muse_engine.engine import (
+    MuseAuthError,
     MuseEngine,
     MuseGenerationError,
+    MuseProxyError,
     MAX_REFERENCE_IMAGES,
 )
-from app.muse_engine.protocol_client import HatchProtocolClient
+from app.muse_engine.protocol_client import (
+    HatchProtocolClient,
+    MuseNoiseClosedError,
+    is_noise_disconnect_error,
+)
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 WEBP_RIFF = b"RIFF"
@@ -332,8 +338,6 @@ class ProtocolEngine:
         from app.muse_engine.protocol_pool import get_worker
 
         deadline = time.monotonic() + max(10, int(timeout))
-        worker = None
-        listener = None
         pooled = bool(use_pool and account_id)
         wall0 = time.perf_counter()
 
@@ -348,255 +352,294 @@ class ProtocolEngine:
             if timeline is not None:
                 timeline.append({"t_ms": round((time.perf_counter() - wall0) * 1000, 1), "event": event, **extra})
 
-        try:
-            if pooled:
-                worker = get_worker(str(account_id))
-                client = await worker.acquire(cookies, proxy)
-                reused = "reuse_hit" in client.timings
-                log("复用纯协议 Noise 会话" if reused else "建立纯协议 Noise 会话（池化）")
-                note("client_ready", reused=reused)
-                node_id = client.new_task_node()
-                listener = await worker.register_listener(node_id)
-                subscription = {"payload": {"capabilities": []}}
-            else:
-                client = HatchProtocolClient(cookies, proxy=proxy)
-                log("建立纯协议 Noise 会话")
-                client._mark("connect_start")
-                await client.connect()
-                local_sub_id, subscription = await client.subscribe()
-                node_id = client.node_id
-                note("client_ready", reused=False)
-            items: list[dict[str, Any]] = []
-            references = list(reference_images or [])
-            if len(references) > MAX_REFERENCE_IMAGES:
-                raise MuseGenerationError(f"参考素材最多 {MAX_REFERENCE_IMAGES} 个")
-            capabilities = (subscription.get("payload") or {}).get("capabilities") or []
-            for index, reference in enumerate(references):
-                try:
-                    encoded, mime = self._normalize_image(reference)
-                    data = base64.b64decode(encoded, validate=True)
-                except (binascii.Error, ValueError) as exc:
-                    raise MuseGenerationError(f"参考素材 {index + 1} 编码无效") from exc
-                filename = f"reference-{index + 1}{mimetypes.guess_extension(mime) or '.bin'}"
-                if should_use_file_ref(len(data), mime, capabilities):
-                    items.append(await client.upload_file_ref(data, mime, filename))
-                else:
-                    items.append({
-                        "type": "image" if mime.startswith("image/") else "file",
-                        "mime_type": mime,
-                        "data_base64": encoded,
-                        "filename": filename,
-                    })
-            items.append({"type": "text", "text": prompt})
-            client._mark("stream_start")
-            body = {"items": items, "node_id": node_id, "capabilities": {}}
-            if marker:
-                body["metadata"] = {"client_marker": marker}
-            scan_offset = 0
-            if pooled and listener is not None:
-                local_sub_id = None
-                while True:
-                    try:
-                        listener.queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-            elif not pooled and local_sub_id is not None:
-                raw_pre = bytes(client.responses[local_sub_id].body)
-                pre_complete = raw_pre.rfind(b"\n")
-                if pre_complete >= 0:
-                    scan_offset = pre_complete + 1
-            log(f"提交 chat.stream（参考素材 {len(references)} 个）")
-            note("stream_send_start", node_id=node_id, marker=marker)
-            sent = await client.request("POST", "/chat/stream", body, 60)
-            if sent.status != 200:
-                raise MuseGenerationError(f"chat.stream HTTP {sent.status}")
+        yielded_output = False
+        max_pool_attempts = 2 if pooled else 1
+        for pool_attempt in range(max_pool_attempts):
+            worker = None
+            listener = None
+            client = None
+            acquired = False
+            reused = False
+            retry_attempt = False
             try:
-                ack_payload = sent.json()
-            except Exception:
-                ack_payload = {}
-            if not isinstance(ack_payload, dict):
-                ack_payload = {}
-            note(
-                "stream_ack",
-                node_id=node_id,
-                message_id=str(ack_payload.get("message_id") or ""),
-                session_id=str(ack_payload.get("session_id") or ""),
-            )
-            if on_progress:
-                on_progress(15)
-            seen: set[Any] = set()
-            text_parts: list[str] = []
-            pending_deltas: list[str] = []
-            candidates: list[dict] = []
-            done: dict | None = None
-            done_at: float | None = None
-            presentation_ready = False
-
-            while time.monotonic() < deadline:
-                events = []
                 if pooled:
+                    worker = get_worker(str(account_id))
+                    client = await worker.acquire(cookies, proxy)
+                    acquired = True
+                    reused = "reuse_hit" in client.timings
+                    log("复用纯协议 Noise 会话" if reused else "建立纯协议 Noise 会话（池化）")
+                    note("client_ready", reused=reused)
+                    node_id = client.new_task_node()
+                    listener = await worker.register_listener(node_id)
+                    subscription = {"payload": {"capabilities": []}}
+                else:
+                    client = HatchProtocolClient(cookies, proxy=proxy)
+                    log("建立纯协议 Noise 会话")
+                    client._mark("connect_start")
+                    await client.connect()
+                    local_sub_id, subscription = await client.subscribe()
+                    node_id = client.node_id
+                    note("client_ready", reused=False)
+                items: list[dict[str, Any]] = []
+                references = list(reference_images or [])
+                if len(references) > MAX_REFERENCE_IMAGES:
+                    raise MuseGenerationError(f"参考素材最多 {MAX_REFERENCE_IMAGES} 个")
+                capabilities = (subscription.get("payload") or {}).get("capabilities") or []
+                for index, reference in enumerate(references):
+                    try:
+                        encoded, mime = self._normalize_image(reference)
+                        data = base64.b64decode(encoded, validate=True)
+                    except (binascii.Error, ValueError) as exc:
+                        raise MuseGenerationError(f"参考素材 {index + 1} 编码无效") from exc
+                    filename = f"reference-{index + 1}{mimetypes.guess_extension(mime) or '.bin'}"
+                    if should_use_file_ref(len(data), mime, capabilities):
+                        items.append(await client.upload_file_ref(data, mime, filename))
+                    else:
+                        items.append({
+                            "type": "image" if mime.startswith("image/") else "file",
+                            "mime_type": mime,
+                            "data_base64": encoded,
+                            "filename": filename,
+                        })
+                items.append({"type": "text", "text": prompt})
+                client._mark("stream_start")
+                body = {"items": items, "node_id": node_id, "capabilities": {}}
+                if marker:
+                    body["metadata"] = {"client_marker": marker}
+                scan_offset = 0
+                if pooled and listener is not None:
+                    local_sub_id = None
                     while True:
                         try:
-                            events.append(listener.queue.get_nowait())
+                            listener.queue.get_nowait()
                         except asyncio.QueueEmpty:
                             break
-                    if not events:
-                        try:
-                            events.append(await asyncio.wait_for(listener.queue.get(), timeout=0.5))
-                        except asyncio.TimeoutError:
-                            events = []
-                else:
-                    raw = bytes(client.responses[local_sub_id].body)
-                    complete = raw.rfind(b"\n", scan_offset)
-                    if complete >= scan_offset:
-                        for line in raw[scan_offset:complete + 1].splitlines():
-                            if not line.strip():
-                                continue
-                            try:
-                                events.append(json.loads(line))
-                            except (ValueError, UnicodeDecodeError):
-                                continue
-                        scan_offset = complete + 1
-                    else:
-                        try:
-                            await client.wait_update(local_sub_id, 0.5)
-                        except asyncio.TimeoutError:
-                            pass
+                elif not pooled and local_sub_id is not None:
+                    raw_pre = bytes(client.responses[local_sub_id].body)
+                    pre_complete = raw_pre.rfind(b"\n")
+                    if pre_complete >= 0:
+                        scan_offset = pre_complete + 1
+                log(f"提交 chat.stream（参考素材 {len(references)} 个）")
+                note("stream_send_start", node_id=node_id, marker=marker)
+                sent = await client.request("POST", "/chat/stream", body, 60)
+                if sent.status != 200:
+                    raise MuseGenerationError(f"chat.stream HTTP {sent.status}")
+                try:
+                    ack_payload = sent.json()
+                except Exception:
+                    ack_payload = {}
+                if not isinstance(ack_payload, dict):
+                    ack_payload = {}
+                note(
+                    "stream_ack",
+                    node_id=node_id,
+                    message_id=str(ack_payload.get("message_id") or ""),
+                    session_id=str(ack_payload.get("session_id") or ""),
+                )
+                if on_progress:
+                    on_progress(15)
+                seen: set[Any] = set()
+                text_parts: list[str] = []
+                pending_deltas: list[str] = []
+                candidates: list[dict] = []
+                done: dict | None = None
+                done_at: float | None = None
+                presentation_ready = False
 
-                for event in events:
-                    if not isinstance(event, dict):
-                        continue
-                    if event.get("type") == "pool_error":
-                        raise MuseGenerationError("Noise 连接已断开，请重试")
-                    sequence = event.get("seq")
-                    if sequence is not None:
-                        if sequence in seen:
+                while time.monotonic() < deadline:
+                    events = []
+                    if pooled:
+                        while True:
+                            try:
+                                events.append(listener.queue.get_nowait())
+                            except asyncio.QueueEmpty:
+                                break
+                        if not events:
+                            try:
+                                events.append(await asyncio.wait_for(listener.queue.get(), timeout=0.5))
+                            except asyncio.TimeoutError:
+                                events = []
+                    else:
+                        raw = bytes(client.responses[local_sub_id].body)
+                        complete = raw.rfind(b"\n", scan_offset)
+                        if complete >= scan_offset:
+                            for line in raw[scan_offset:complete + 1].splitlines():
+                                if not line.strip():
+                                    continue
+                                try:
+                                    events.append(json.loads(line))
+                                except (ValueError, UnicodeDecodeError):
+                                    continue
+                            scan_offset = complete + 1
+                        else:
+                            try:
+                                await client.wait_update(local_sub_id, 0.5)
+                            except asyncio.TimeoutError:
+                                pass
+
+                    for event in events:
+                        if not isinstance(event, dict):
                             continue
-                        seen.add(sequence)
-                    name = event.get("event") or event.get("type")
-                    payload = event.get("payload")
-                    if name == "res" or not isinstance(payload, dict):
-                        continue
-                    device_id = _payload_device_id(payload)
-                    if device_id and device_id != node_id:
-                        continue
-                    ours = device_id == node_id
-                    if name == "delta.text_append":
-                        if not ours:
+                        if event.get("type") == "pool_error":
+                            raise MuseNoiseClosedError("Noise 连接已断开，请重试")
+                        sequence = event.get("seq")
+                        if sequence is not None:
+                            if sequence in seen:
+                                continue
+                            seen.add(sequence)
+                        name = event.get("event") or event.get("type")
+                        payload = event.get("payload")
+                        if name == "res" or not isinstance(payload, dict):
                             continue
-                        if "first_event" not in client.timings:
-                            client._mark("first_event")
-                            note("first_event", node_id=node_id)
-                        delta = str(payload.get("text") or "")
-                        if delta:
-                            text_parts.append(delta)
-                            if expect is None:
-                                pending_deltas.append(delta)
-                    if name in (
-                        "delta.presentation",
-                        "delta.message_done",
-                        "delta.tool_done",
-                        "delta.placeholder",
-                    ):
-                        before = len(candidates)
-                        _scoped_media_candidates(
-                            name,
-                            payload,
-                            node_id=node_id,
-                            marker=marker,
-                            output=candidates,
-                        )
-                        if name == "delta.presentation" and len(candidates) > before:
-                            presentation_ready = True
+                        device_id = _payload_device_id(payload)
+                        if device_id and device_id != node_id:
+                            continue
+                        ours = device_id == node_id
+                        if name == "delta.text_append":
+                            if not ours:
+                                continue
                             if "first_event" not in client.timings:
                                 client._mark("first_event")
-                                note("first_event", node_id=node_id, kind="presentation")
-                    if name == "delta.message_done":
-                        status = payload.get("status")
-                        if ours and status not in (None, "completed"):
-                            raise MuseGenerationError(f"Muse generation failed: {status}")
-                        if ours or (expect is not None and (presentation_ready or candidates)):
-                            if status in (None, "completed") or not ours:
-                                done = payload
-                                done_at = time.monotonic()
-                                note("message_done", node_id=node_id, ours=ours)
-                                if on_progress:
-                                    on_progress(85)
-                    if name == "delta.message_removed" and ours:
-                        raise MuseGenerationError("Muse removed the generation before completion")
-
-                if pending_deltas and expect is None:
-                    for delta in pending_deltas:
-                        yield {"type": "text", "text": delta}
-                    pending_deltas.clear()
-                if done is not None and expect is None:
-                    text = "".join(text_parts)
-                    if not text:
-                        content = []
-                        for message in _scoped_transcript_messages(
-                            done.get("transcript"), node_id=node_id, marker=marker
+                                note("first_event", node_id=node_id)
+                            delta = str(payload.get("text") or "")
+                            if delta:
+                                text_parts.append(delta)
+                                if expect is None:
+                                    pending_deltas.append(delta)
+                        if name in (
+                            "delta.presentation",
+                            "delta.message_done",
+                            "delta.tool_done",
+                            "delta.placeholder",
                         ):
-                            if message.get("role") == "user":
-                                continue
-                            for part in message.get("content") or []:
-                                if isinstance(part, dict) and part.get("type") == "text":
-                                    content.append(str(part.get("text") or ""))
-                        text = "".join(content)
-                    client._mark("generation_done")
-                    note("generation_done", node_id=node_id, text_len=len(text))
-                    yield {
-                        "type": "result",
-                        "text": text,
-                        "timings": dict(client.timings),
-                        "node_id": node_id,
-                        "marker": marker,
-                        "timeline": list(timeline or []),
-                    }
-                    return
-                if expect is not None:
-                    matching = [
-                        c["resource"]
-                        for c in candidates
-                        if _resource_kind(c["resource"]) == expect
-                    ]
-                    if matching and (presentation_ready or done is not None):
-                        resource = matching[-1]
-                        log("检测到成品，通过 fs.read 取回")
+                            before = len(candidates)
+                            _scoped_media_candidates(
+                                name,
+                                payload,
+                                node_id=node_id,
+                                marker=marker,
+                                output=candidates,
+                            )
+                            if name == "delta.presentation" and len(candidates) > before:
+                                presentation_ready = True
+                                if "first_event" not in client.timings:
+                                    client._mark("first_event")
+                                    note("first_event", node_id=node_id, kind="presentation")
+                        if name == "delta.message_done":
+                            status = payload.get("status")
+                            if ours and status not in (None, "completed"):
+                                raise MuseGenerationError(f"Muse generation failed: {status}")
+                            if ours or (expect is not None and (presentation_ready or candidates)):
+                                if status in (None, "completed") or not ours:
+                                    done = payload
+                                    done_at = time.monotonic()
+                                    note("message_done", node_id=node_id, ours=ours)
+                                    if on_progress:
+                                        on_progress(85)
+                        if name == "delta.message_removed" and ours:
+                            raise MuseGenerationError("Muse removed the generation before completion")
+
+                    if pending_deltas and expect is None:
+                        for delta in pending_deltas:
+                            yielded_output = True
+                            yield {"type": "text", "text": delta}
+                        pending_deltas.clear()
+                    if done is not None and expect is None:
+                        text = "".join(text_parts)
+                        if not text:
+                            content = []
+                            for message in _scoped_transcript_messages(
+                                done.get("transcript"), node_id=node_id, marker=marker
+                            ):
+                                if message.get("role") == "user":
+                                    continue
+                                for part in message.get("content") or []:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        content.append(str(part.get("text") or ""))
+                            text = "".join(content)
                         client._mark("generation_done")
-                        data = await client.download_bytes(resource)
-                        note("fs_read_done", bytes=len(data))
+                        note("generation_done", node_id=node_id, text_len=len(text))
+                        yielded_output = True
                         yield {
                             "type": "result",
-                            "data": data,
-                            "resource": resource,
-                            "text": "".join(text_parts),
+                            "text": text,
                             "timings": dict(client.timings),
-                            "download_via": "protocol.noise.fs.read",
                             "node_id": node_id,
                             "marker": marker,
                             "timeline": list(timeline or []),
                         }
                         return
-                    if done is not None and done_at is not None and time.monotonic() - done_at >= 12:
-                        raise MuseGenerationError(f"生成完成但未收到 {expect} 成品")
-            raise MuseGenerationError("纯协议生成超时，未收到完整结果")
-        except asyncio.TimeoutError:
-            raise MuseGenerationError("纯协议上游请求超时") from None
-        finally:
-            if listener is not None and worker is not None:
-                try:
-                    await worker.unregister_listener(listener.node_id)
-                except Exception:
-                    pass
-                try:
-                    await worker.release()
-                except Exception:
-                    pass
-            elif not pooled:
-                try:
-                    await client.close()
-                except Exception:
-                    pass
+                    if expect is not None:
+                        matching = [
+                            c["resource"]
+                            for c in candidates
+                            if _resource_kind(c["resource"]) == expect
+                        ]
+                        if matching and (presentation_ready or done is not None):
+                            resource = matching[-1]
+                            log("检测到成品，通过 fs.read 取回")
+                            client._mark("generation_done")
+                            data = await client.download_bytes(resource)
+                            note("fs_read_done", bytes=len(data))
+                            yielded_output = True
+                            yield {
+                                "type": "result",
+                                "data": data,
+                                "resource": resource,
+                                "text": "".join(text_parts),
+                                "timings": dict(client.timings),
+                                "download_via": "protocol.noise.fs.read",
+                                "node_id": node_id,
+                                "marker": marker,
+                                "timeline": list(timeline or []),
+                            }
+                            return
+                        if done is not None and done_at is not None and time.monotonic() - done_at >= 12:
+                            raise MuseGenerationError(f"生成完成但未收到 {expect} 成品")
+                raise MuseGenerationError("纯协议生成超时，未收到完整结果")
+            except asyncio.TimeoutError:
+                raise MuseGenerationError("纯协议上游请求超时") from None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                disconnect = is_noise_disconnect_error(exc)
+                if pooled and worker is not None and client is not None and disconnect:
+                    try:
+                        await worker.invalidate_client(client)
+                    except Exception:
+                        pass
+                if (
+                    pooled
+                    and reused
+                    and pool_attempt + 1 < max_pool_attempts
+                    and not yielded_output
+                    and disconnect
+                ):
+                    retry_attempt = True
+                    log("复用纯协议 Noise 会话已断开，正在重建连接")
+                    note("pool_reconnect", reason=str(exc))
+                    continue
+                if disconnect and not isinstance(exc, MuseGenerationError):
+                    raise MuseNoiseClosedError(
+                        f"Noise 连接已断开 ({type(exc).__name__}: {exc})"
+                    ) from None
+                raise
+            finally:
+                if listener is not None and worker is not None:
+                    try:
+                        await worker.unregister_listener(listener.node_id)
+                    except Exception:
+                        pass
+                if acquired and worker is not None:
+                    try:
+                        await worker.release()
+                    except Exception:
+                        pass
+                elif not pooled and client is not None and not retry_attempt:
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
 
     def chat_stream(
         self,
@@ -638,11 +681,20 @@ class ProtocolEngine:
                             emitted.append(event["text"])
                 return emitted, result_meta
 
-            if account_id and use_pool:
-                from app.muse_engine.protocol_pool import get_worker
-                texts, meta = get_worker(str(account_id)).call(collect(), timeout=timeout + 60)
-            else:
-                texts, meta = asyncio.run(collect())
+            try:
+                if account_id and use_pool:
+                    from app.muse_engine.protocol_pool import get_worker
+                    texts, meta = get_worker(str(account_id)).call(collect(), timeout=timeout + 60)
+                else:
+                    texts, meta = asyncio.run(collect())
+            except (MuseAuthError, MuseProxyError, MuseGenerationError):
+                raise
+            except Exception as exc:
+                if is_noise_disconnect_error(exc):
+                    raise MuseNoiseClosedError(
+                        f"Noise 连接已断开 ({type(exc).__name__}: {exc})"
+                    ) from None
+                raise MuseGenerationError(f"纯协议对话失败 ({type(exc).__name__})") from None
             if meta.get("timings") is not None:
                 timeline.append({"timings_ms": timing_deltas(meta.get("timings") or {})})
             for text in texts:
@@ -701,9 +753,13 @@ class ProtocolEngine:
                     result = get_worker(str(account_id)).call(collect(), timeout=int(timeout) + 120)
                 else:
                     result = asyncio.run(collect())
-            except MuseGenerationError:
+            except (MuseAuthError, MuseProxyError, MuseGenerationError):
                 raise
-            except Exception:
+            except Exception as exc:
+                if is_noise_disconnect_error(exc):
+                    raise MuseNoiseClosedError(
+                        f"Noise 连接已断开 ({type(exc).__name__}: {exc})"
+                    ) from None
                 raise MuseGenerationError("纯协议生成失败") from None
             data = result["data"]
             resource = result["resource"]

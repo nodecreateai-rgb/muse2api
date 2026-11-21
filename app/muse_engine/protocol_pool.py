@@ -24,6 +24,15 @@ from app.muse_engine.protocol_client import HatchProtocolClient
 
 logger = logging.getLogger("muse-proxy.protocol_pool")
 
+
+def _client_is_alive(client: Any) -> bool:
+    """Return True when a pooled client holds an open, live WebSocket session."""
+    if client is None or getattr(client, "closing", False):
+        return False
+    if hasattr(client, "is_alive"):
+        return bool(client.is_alive())
+    return bool(getattr(client, "ws", None))
+
 _HUB_GUARD = threading.Lock()
 _WORKERS: dict[str, "AccountNoiseWorker"] = {}
 
@@ -82,12 +91,12 @@ class AccountNoiseWorker:
         pk = self._proxy_key(proxy)
         client = self.client
         alive = bool(
-            client
-            and client.ws
-            and not client.closing
+            _client_is_alive(client)
             and self.cookie_fp == fp
             and self.proxy_key == pk
             and self.subscription_id is not None
+            and self._dispatch_task is not None
+            and not self._dispatch_task.done()
         )
         if alive:
             client.reset_timings()
@@ -95,14 +104,7 @@ class AccountNoiseWorker:
             return client
 
         if client is not None:
-            try:
-                await client.close()
-            except Exception:
-                pass
-            self.client = None
-            self.subscription_id = None
-            self._dispatch_task = None
-            self._scan_offset = 0
+            await self.invalidate_client(client)
 
         client = HatchProtocolClient(cookies, proxy=proxy)
         client._mark("connect_start")
@@ -117,8 +119,16 @@ class AccountNoiseWorker:
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
         return client
 
+    def _notify_listeners_error(self, error: str) -> None:
+        for listener in list(self.listeners.values()):
+            try:
+                listener.queue.put_nowait({"type": "pool_error", "error": error})
+            except Exception:
+                pass
+
     async def _dispatch_loop(self) -> None:
         """Single reader for the shared subscribe stream; fan-out by device_id."""
+        broken_client: HatchProtocolClient | None = None
         try:
             while True:
                 client = self.client
@@ -126,6 +136,12 @@ class AccountNoiseWorker:
                 if not client or sub_id is None:
                     await asyncio.sleep(0.05)
                     continue
+                if (hasattr(client, "is_alive") and not client.is_alive()) or getattr(
+                    client, "closing", False
+                ):
+                    broken_client = client
+                    self._notify_listeners_error("noise_closed")
+                    break
                 response = client.responses.get(sub_id)
                 if response is None:
                     await asyncio.sleep(0.05)
@@ -170,16 +186,16 @@ class AccountNoiseWorker:
                     await client.wait_update(sub_id, 0.5)
                 except asyncio.TimeoutError:
                     pass
-                except Exception:
-                    # Connection died — fail listeners and exit; next ensure reconnects.
-                    for listener in list(self.listeners.values()):
-                        try:
-                            listener.queue.put_nowait({"type": "pool_error", "error": "noise_closed"})
-                        except Exception:
-                            pass
+                except Exception as exc:
+                    # Connection died — fail listeners, detach stale client, and exit.
+                    broken_client = client
+                    self._notify_listeners_error(str(exc) or "noise_closed")
                     break
         except asyncio.CancelledError:
             raise
+        finally:
+            if broken_client is not None:
+                await self.invalidate_client(broken_client)
 
     async def acquire(self, cookies: dict, proxy: dict | None) -> HatchProtocolClient:
         self._refs += 1
@@ -198,31 +214,43 @@ class AccountNoiseWorker:
     async def unregister_listener(self, node_id: str) -> None:
         self.listeners.pop(node_id, None)
 
-    async def close_client(self) -> None:
-        if self._dispatch_task:
-            self._dispatch_task.cancel()
-            try:
-                await self._dispatch_task
-            except Exception:
-                pass
-            self._dispatch_task = None
-        if self.client:
-            try:
-                await self.client.close()
-            except Exception:
-                pass
+    async def invalidate_client(
+        self, expected_client: HatchProtocolClient | None = None
+    ) -> None:
+        """Detach and close a dead or stale client without touching a newer one."""
+        client = self.client
+        if expected_client is not None and client is not expected_client:
+            return
+        dispatch = self._dispatch_task
+        self._dispatch_task = None
         self.client = None
         self.subscription_id = None
+        self._scan_offset = 0
+        if dispatch and dispatch is not asyncio.current_task():
+            dispatch.cancel()
+            await asyncio.gather(dispatch, return_exceptions=True)
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    async def close_client(self) -> None:
+        await self.invalidate_client()
         self.listeners.clear()
 
     def shutdown(self) -> None:
         self._closed = True
         try:
-            self.call(self.close_client(), timeout=15)
+            asyncio.run_coroutine_threadsafe(self.close_client(), self.loop).result(timeout=15)
         except Exception:
             pass
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(timeout=5)
+        try:
+            self.loop.close()
+        except Exception:
+            pass
 
 
 def get_worker(account_id: str) -> AccountNoiseWorker:
@@ -253,12 +281,12 @@ def has_warm_worker(account_id: str | None) -> bool:
     if worker is None or worker._closed:
         return False
     client = worker.client
-    return bool(
-        client
-        and client.ws
-        and not client.closing
-        and worker.subscription_id is not None
-    )
+    if worker.subscription_id is None or not _client_is_alive(client):
+        return False
+    dispatch = worker._dispatch_task
+    if dispatch is not None and dispatch.done():
+        return False
+    return True
 
 
 def warm_account_ids() -> list[str]:

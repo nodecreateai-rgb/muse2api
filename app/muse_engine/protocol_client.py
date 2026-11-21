@@ -21,6 +21,11 @@ from urllib.parse import urlencode
 
 import requests
 import websockets
+from websockets.exceptions import ConnectionClosed
+try:
+    from websockets.protocol import State as _WSState
+except ImportError:  # pragma: no cover
+    _WSState = None
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -32,6 +37,17 @@ from app.muse_engine.browser_proxy import (
     request_proxy_context,
 )
 from app.muse_engine.engine import MuseAuthError, MuseGenerationError, MuseProxyError
+
+
+class MuseNoiseClosedError(MuseGenerationError):
+    """Raised when the Noise WebSocket transport closes or breaks unexpectedly."""
+
+
+def is_noise_disconnect_error(exc: BaseException) -> bool:
+    """True for Noise/WebSocket/TCP disconnects (excluding asyncio timeouts)."""
+    if isinstance(exc, asyncio.TimeoutError):
+        return False
+    return isinstance(exc, (MuseNoiseClosedError, ConnectionClosed, ConnectionError, EOFError))
 
 PROTOCOL = b"Noise_XX_25519_AESGCM_SHA256"
 MAX_PLAINTEXT_FRAME = 65489
@@ -201,6 +217,7 @@ class HatchProtocolClient:
         self.heartbeat_task: asyncio.Task | None = None
         self.node_id = str(uuid.uuid4())
         self.closing = False
+        self._closed_error: Exception | None = None
         self.timings: dict[str, float] = {}
         self.timing_meta: dict[str, object] = {}
         self._http_session = requests.Session()
@@ -208,6 +225,32 @@ class HatchProtocolClient:
 
     def _mark(self, name: str) -> None:
         self.timings[name] = time.perf_counter()
+
+    def is_alive(self) -> bool:
+        """Return True when the Noise WebSocket and background tasks remain live."""
+        ws = self.ws
+        if ws is None or self.closing:
+            return False
+        if getattr(ws, "close_code", None) is not None or getattr(ws, "closed", False):
+            return False
+        state = getattr(ws, "state", None)
+        if state is not None:
+            if _WSState is not None and isinstance(state, _WSState):
+                if state != _WSState.OPEN:
+                    return False
+            elif getattr(state, "name", None) not in (None, "OPEN"):
+                return False
+        if self.receiver_task is not None and self.receiver_task.done():
+            return False
+        if self.heartbeat_task is not None and self.heartbeat_task.done():
+            return False
+        return True
+
+    def _mark_dead(self, err: Exception) -> None:
+        if self._closed_error is None:
+            self._closed_error = err
+        self.closing = True
+        self._fail_waiters(err)
 
     def _http(self, method: str, url: str, body: dict | None = None) -> dict:
         headers = {
@@ -328,6 +371,7 @@ class HatchProtocolClient:
             self.ws = await websockets.connect(
                 url, max_size=4 * 1024 * 1024, max_queue=64,
                 open_timeout=30, close_timeout=3,
+                ping_interval=20, ping_timeout=20,
                 origin="https://muse.ai", user_agent_header=USER_AGENT,
                 additional_headers={
                     "Accept-Language": "en-US,en-GB;q=0.9,en;q=0.8",
@@ -356,13 +400,30 @@ class HatchProtocolClient:
             self.send_cipher, self.recv_cipher = noise.split()
             self._mark("noise")
         except (MuseAuthError, MuseProxyError, MuseGenerationError):
+            if self.ws is not None:
+                try:
+                    await self.ws.close()
+                except Exception:
+                    pass
+                self.ws = None
+            if self.relay:
+                self.relay.close()
+                self.relay = None
             raise
         except Exception as exc:
+            if self.ws is not None:
+                try:
+                    await self.ws.close()
+                except Exception:
+                    pass
+                self.ws = None
             if self.relay:
                 self.relay.close()
                 self.relay = None
             error = MuseProxyError if self.proxy else MuseGenerationError
             raise error(f"Noise WebSocket connection failed ({type(exc).__name__})") from None
+        self.closing = False
+        self._closed_error = None
         self.receiver_task = asyncio.create_task(self._receiver())
         self.heartbeat_task = asyncio.create_task(self._heartbeat())
 
@@ -409,23 +470,39 @@ class HatchProtocolClient:
                     response.ended = True
                 self._notify(stream_id)
             if not self.closing:
-                self._fail_waiters(MuseGenerationError("Noise connection closed"))
+                self._mark_dead(MuseNoiseClosedError("Noise connection closed"))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._fail_waiters(
-                MuseGenerationError(f"Noise receive failed ({type(exc).__name__})")
+            self._mark_dead(
+                MuseNoiseClosedError(f"Noise receive failed ({type(exc).__name__})")
             )
+        finally:
+            if self.closing and self.heartbeat_task and not self.heartbeat_task.done():
+                if self.heartbeat_task is not asyncio.current_task():
+                    self.heartbeat_task.cancel()
 
     async def _heartbeat(self) -> None:
         try:
-            while True:
-                await asyncio.sleep(30)
+            while not self.closing:
+                await asyncio.sleep(25)
+                if self.closing or not self.is_alive():
+                    break
                 await self.request("POST", "/api/ping", {"presence": "active"}, 15)
         except asyncio.CancelledError:
             raise
+        except Exception as exc:
+            if not self.closing:
+                err = (
+                    exc
+                    if isinstance(exc, MuseNoiseClosedError)
+                    else MuseNoiseClosedError(f"Noise heartbeat failed ({type(exc).__name__})")
+                )
+                self._mark_dead(err)
 
     async def wait_update(self, stream_id: int, timeout: float = 30) -> None:
+        if self.closing or (self.receiver_task is not None and self.receiver_task.done()):
+            raise self._closed_error or MuseNoiseClosedError("Noise connection closed")
         waiter = asyncio.get_running_loop().create_future()
         self.waiters.setdefault(stream_id, set()).add(waiter)
         try:
@@ -466,6 +543,10 @@ class HatchProtocolClient:
         if self._send_lock is None:
             self._send_lock = asyncio.Lock()
         async with self._send_lock:
+            if self.closing or self.ws is None or not self.is_alive():
+                err = self._closed_error or MuseNoiseClosedError("Noise connection closed")
+                self._mark_dead(err)
+                raise err
             stream_id = self.next_stream
             self.next_stream += 1
             self.responses[stream_id] = Response()
@@ -486,7 +567,16 @@ class HatchProtocolClient:
             frame = pb.ServiceFrame(stream_id=stream_id, request=request)
             service = pb.ServiceRequest(service=pb.SERVICE_DAEMON, payload=frame.SerializeToString())
             for encrypted in self._pack(service):
-                await self.ws.send(encrypted)
+                try:
+                    await self.ws.send(encrypted)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    err = MuseNoiseClosedError(
+                        f"Noise connection closed ({type(exc).__name__}: {exc})"
+                    )
+                    self._mark_dead(err)
+                    raise err from None
             return stream_id
 
     async def request(

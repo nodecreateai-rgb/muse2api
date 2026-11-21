@@ -331,9 +331,11 @@ def _sync_chat_stream(
     cfg2 = engine_config()
     max_attempts = max(2, min(int(getattr(cfg2, "acct_rotate_attempts", 5) or 5), 8))
     tried_ids: set[str] = set()
+    skipped_renew_id: str | None = None
+    retried_skipped_renew = False
     timing = timing if timing is not None else _new_request_timing()
     t0 = time.perf_counter()
-    for attempt in range(max_attempts):
+    for attempt in range(max_attempts + 1):
         acc: dict[str, Any] = {}
         try:
             t_pick = time.perf_counter()
@@ -386,9 +388,19 @@ def _sync_chat_stream(
             return
         except (MuseAuthError, MuseProxyError, MuseGenerationError) as exc:
             if not acc and last_err is not None and str(exc) == EMPTY_POOL_MSG:
+                if skipped_renew_id and not retried_skipped_renew:
+                    # Only one account existed and it skipped HTTP renewal on warm check;
+                    # allow one full HTTP renewal retry before giving up.
+                    tried_ids.discard(skipped_renew_id)
+                    skipped_renew_id = None
+                    retried_skipped_renew = True
+                    continue
                 break
             last_err = exc
-            _note_account_failure(str(acc.get("id") or ""), exc)
+            aid_fail = str(acc.get("id") or "")
+            if aid_fail and timing.get("renew_skipped") and not retried_skipped_renew:
+                skipped_renew_id = aid_fail
+            _note_account_failure(aid_fail, exc)
             logger.warning("chat attempt %s failed: %s", attempt + 1, exc)
             continue
     _finalize_timing(timing, t0)
