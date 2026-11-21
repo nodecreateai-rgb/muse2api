@@ -581,6 +581,122 @@ class StreamIsolationTests(unittest.TestCase):
             worker.client = None
             worker.shutdown()
 
+    def test_chat_delta_without_chat_context_correlates_via_message_start_and_transcript(self):
+        import asyncio
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from app.muse_engine.config import EngineConfig
+        from app.muse_engine.protocol_engine import ProtocolEngine
+
+        class FakeTextClient:
+            def __init__(self, include_deltas: bool = True):
+                self.node_id = "node-chat-1"
+                self.timings = {}
+                self.responses = {1: SimpleNamespace(body=bytearray())}
+                self.include_deltas = include_deltas
+
+            def _mark(self, name):
+                self.timings[name] = 1.0
+
+            async def connect(self):
+                return None
+
+            async def subscribe(self):
+                return 1, {"status": "ok", "payload": {"capabilities": []}}
+
+            async def request(self, method, path, body, timeout):
+                # Replicate live Hatch event shape: delta.text_append carries NO chat_context,
+                # only message_id / parent_message_id announced in delta.message_start.
+                events = [
+                    {
+                        "event": "delta.message_start",
+                        "seq": 28,
+                        "payload": {
+                            "chat_context": {"device_id": self.node_id},
+                            "message_id": "assistant-msg-ours",
+                            "reply_to_message_id": "",
+                        },
+                    },
+                    # Foreign concurrent delta without chat_context must be dropped
+                    {
+                        "event": "delta.text_append",
+                        "seq": 29,
+                        "payload": {
+                            "message_id": "assistant-msg-foreign",
+                            "parent_message_id": "assistant-msg-foreign",
+                            "text": "FOREIGN-",
+                        },
+                    },
+                ]
+                if self.include_deltas:
+                    events.append(
+                        {
+                            "event": "delta.text_append",
+                            "seq": 30,
+                            "payload": {
+                                "message_id": "assistant-msg-ours",
+                                "parent_message_id": "assistant-msg-ours",
+                                "text": "hello ",
+                            },
+                        }
+                    )
+                    events.append(
+                        {
+                            "event": "delta.text_append",
+                            "seq": 31,
+                            "payload": {
+                                "message_id": "assistant-msg-ours",
+                                "parent_message_id": "assistant-msg-ours",
+                                "text": "world",
+                            },
+                        }
+                    )
+                events.append(
+                    {
+                        "event": "delta.message_done",
+                        "seq": 32,
+                        "payload": {
+                            "chat_context": {"device_id": self.node_id},
+                            "message_id": "assistant-msg-ours",
+                            "reply_to_message_id": "",
+                            "status": "completed",
+                            "transcript": {
+                                "reply_to_message_id": "",
+                                "messages": [
+                                    {
+                                        "id": "assistant-msg-ours",
+                                        "role": "assistant",
+                                        "content": [{"type": "text", "text": "hello world"}],
+                                    }
+                                ],
+                            },
+                        },
+                    }
+                )
+                self.responses[1].body.extend(
+                    "".join(json.dumps(ev) + "\n" for ev in events).encode()
+                )
+                return SimpleNamespace(
+                    status=200,
+                    json=lambda: {"message_id": "user-msg-1", "reply_to_message_id": "user-msg-1"},
+                )
+
+            async def wait_update(self, sub_id, timeout):
+                await asyncio.sleep(0.01)
+
+            async def close(self):
+                return None
+
+        eng = ProtocolEngine(EngineConfig())
+        with patch("app.muse_engine.protocol_engine.HatchProtocolClient", return_value=FakeTextClient(True)):
+            got = "".join(eng.chat_stream({"hatch_sess": "h"}, "hi", use_pool=False))
+        self.assertEqual(got, "hello world")
+
+        with patch("app.muse_engine.protocol_engine.HatchProtocolClient", return_value=FakeTextClient(False)):
+            got_fallback = "".join(eng.chat_stream({"hatch_sess": "h"}, "hi", use_pool=False))
+        self.assertEqual(got_fallback, "hello world")
+
 
 class NoiseDisconnectRecoveryTests(unittest.TestCase):
     def test_client_liveness_and_send_disconnect_conversion(self):

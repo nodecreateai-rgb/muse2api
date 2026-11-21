@@ -207,30 +207,94 @@ def _payload_device_id(payload: dict) -> str | None:
     return None
 
 
+def _event_is_ours(
+    name: str,
+    payload: dict[str, Any],
+    *,
+    node_id: str,
+    ack_msg_id: str,
+    turn_msg_ids: set[str],
+) -> tuple[bool, bool]:
+    """Return (belongs_to_task, is_foreign) for a Hatch subscribe event.
+
+    Hatch omits chat_context on delta.text_append; those deltas correlate via the
+    assistant message_id / parent_message_id announced in delta.message_start
+    (or reply_to_message_id when present).
+    """
+    device_id = _payload_device_id(payload)
+    if device_id:
+        if device_id != node_id:
+            return False, True
+        msg_id = str(payload.get("message_id") or "")
+        if msg_id and name != "message.user":
+            turn_msg_ids.add(msg_id)
+        return True, False
+
+    reply_to = str(payload.get("reply_to_message_id") or "")
+    msg_id = str(payload.get("message_id") or "")
+    parent_id = str(payload.get("parent_message_id") or "")
+
+    if reply_to and ack_msg_id:
+        if reply_to != ack_msg_id:
+            return False, True
+        if msg_id and name != "message.user":
+            turn_msg_ids.add(msg_id)
+        return True, False
+
+    if (msg_id and msg_id in turn_msg_ids) or (parent_id and parent_id in turn_msg_ids):
+        if msg_id and name != "message.user":
+            turn_msg_ids.add(msg_id)
+        return True, False
+
+    if msg_id and turn_msg_ids:
+        return False, True
+
+    # Offline stubs without device_id/message_id/ack correlation.
+    if not msg_id and not reply_to and not ack_msg_id:
+        return True, False
+    return False, False
+
+
 def _scoped_transcript_messages(
     transcript: Any,
     *,
     node_id: str,
     marker: str | None,
+    target_msg_id: str | None = None,
+    ack_msg_id: str | None = None,
+    trusted_parent: bool = False,
 ) -> list[dict[str, Any]]:
     """Return transcript messages strictly belonging to the active turn."""
     if not isinstance(transcript, dict):
+        return []
+    tr_reply = str(transcript.get("reply_to_message_id") or "")
+    if ack_msg_id and tr_reply and tr_reply != ack_msg_id:
         return []
     messages = transcript.get("messages")
     if not isinstance(messages, list):
         return []
 
+    has_any_device = False
     turn_start: int | None = None
     for idx, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
         m_dev = _payload_device_id(msg)
+        if m_dev:
+            has_any_device = True
         m_meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
         m_marker = m_meta.get("client_marker")
-        if (m_dev and m_dev == node_id) or (marker and m_marker == marker):
+        m_id = str(msg.get("id") or "")
+        if (
+            (m_dev and m_dev == node_id)
+            or (marker and m_marker == marker)
+            or (target_msg_id and m_id == target_msg_id)
+        ):
             if msg.get("role") == "user" or turn_start is None:
                 turn_start = idx
     if turn_start is None:
+        if trusted_parent and not has_any_device:
+            return [m for m in messages if isinstance(m, dict)]
         return []
 
     scoped: list[dict[str, Any]] = []
@@ -263,7 +327,11 @@ def _scoped_media_candidates(
     _media_candidates(trimmed, output)
 
     for msg in _scoped_transcript_messages(
-        payload.get("transcript"), node_id=node_id, marker=marker
+        payload.get("transcript"),
+        node_id=node_id,
+        marker=marker,
+        target_msg_id=str(payload.get("message_id") or "") or None,
+        trusted_parent=_payload_device_id(payload) == node_id,
     ):
         _media_candidates(msg, output)
 
@@ -430,6 +498,9 @@ class ProtocolEngine:
                     ack_payload = {}
                 if not isinstance(ack_payload, dict):
                     ack_payload = {}
+                ack_msg_id = str(
+                    ack_payload.get("reply_to_message_id") or ack_payload.get("message_id") or ""
+                )
                 note(
                     "stream_ack",
                     node_id=node_id,
@@ -439,6 +510,7 @@ class ProtocolEngine:
                 if on_progress:
                     on_progress(15)
                 seen: set[Any] = set()
+                turn_msg_ids: set[str] = set()
                 text_parts: list[str] = []
                 pending_deltas: list[str] = []
                 candidates: list[dict] = []
@@ -487,14 +559,19 @@ class ProtocolEngine:
                             if sequence in seen:
                                 continue
                             seen.add(sequence)
-                        name = event.get("event") or event.get("type")
+                        name = str(event.get("event") or event.get("type") or "")
                         payload = event.get("payload")
                         if name == "res" or not isinstance(payload, dict):
                             continue
-                        device_id = _payload_device_id(payload)
-                        if device_id and device_id != node_id:
+                        ours, foreign = _event_is_ours(
+                            name,
+                            payload,
+                            node_id=node_id,
+                            ack_msg_id=ack_msg_id,
+                            turn_msg_ids=turn_msg_ids,
+                        )
+                        if foreign:
                             continue
-                        ours = device_id == node_id
                         if name == "delta.text_append":
                             if not ours:
                                 continue
@@ -549,7 +626,12 @@ class ProtocolEngine:
                         if not text:
                             content = []
                             for message in _scoped_transcript_messages(
-                                done.get("transcript"), node_id=node_id, marker=marker
+                                done.get("transcript"),
+                                node_id=node_id,
+                                marker=marker,
+                                target_msg_id=str(done.get("message_id") or "") or None,
+                                ack_msg_id=ack_msg_id,
+                                trusted_parent=True,
                             ):
                                 if message.get("role") == "user":
                                     continue
