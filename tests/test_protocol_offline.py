@@ -72,6 +72,29 @@ class ProtocolHelperTests(unittest.TestCase):
         _media_candidates(payload, out)
         self.assertEqual(out, [])
 
+        onboarding = {"path": "sandbox://workspace/onboarding_tour/goals.png", "mime": "image/png"}
+        out2: list = []
+        _media_candidates(onboarding, out2)
+        self.assertEqual(out2, [])
+
+    def test_resource_kind_rejects_markdown_and_text_as_non_image(self):
+        self.assertEqual(
+            _resource_kind({"path": "sandbox://workspace/wallpapers/2026-11-26-index.md", "mime": "text/markdown"}),
+            "other",
+        )
+        self.assertEqual(
+            _resource_kind({"path": "sandbox://workspace/note.md"}),
+            "other",
+        )
+        self.assertEqual(
+            _resource_kind({"path": "sandbox://workspace/out.webp", "mime": "application/octet-stream"}),
+            "image",
+        )
+        self.assertEqual(
+            _resource_kind({"path": "sandbox://workspace/out.svg", "mime": "image/svg+xml"}),
+            "other",
+        )
+
 
 class ProxyParseTests(unittest.TestCase):
     def test_host_port_user_pass_default_http(self):
@@ -1025,3 +1048,182 @@ class NoiseDisconnectRecoveryTests(unittest.TestCase):
                     self.assertFalse(has_warm_worker(acc_id))
         finally:
             drop_worker(acc_id)
+
+    def test_connect_wakes_and_retries_on_invalid_status_and_reports_http_code(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from websockets.datastructures import Headers
+        from websockets.exceptions import InvalidStatus
+        from websockets.http11 import Response as WSHTTPResponse
+        from app.muse_engine.engine import MuseGenerationError
+        from app.muse_engine.protocol_client import HatchProtocolClient
+
+        client = HatchProtocolClient({"hatch_sess": "demo"})
+        http_calls: list[str] = []
+
+        def fake_http(method, url, body=None):
+            http_calls.append(url.split("?")[0])
+            if "api/session" in url:
+                return {
+                    "status": "assigned",
+                    "vm_id": "vm-wake-1",
+                    "endpoint_url": "wss://vm-wake-1.example.test/",
+                    "vm_state": "UNKNOWN",
+                    "vm_type": "hatch_vm",
+                }
+            if "api/hatch/token" in url:
+                return {"token": "tok-1"}
+            if "vm/wake" in url:
+                return {"status": "wake_requested"}
+            raise AssertionError(f"unexpected {method} {url}")
+
+        client._http = fake_http  # type: ignore[method-assign]
+        dial_count = 0
+
+        async def fake_dial(session, vm_id, auth_token, notary):
+            nonlocal dial_count
+            dial_count += 1
+            if dial_count == 1:
+                raise InvalidStatus(WSHTTPResponse(503, "Service Unavailable", Headers()))
+            # Second dial succeeds (skip real tasks)
+            return None
+
+        async def noop():
+            return None
+
+        client._dial_noise_ws = fake_dial  # type: ignore[method-assign]
+        with patch("app.muse_engine.protocol_client.asyncio.sleep", AsyncMock()), \
+             patch.object(client, "_receiver", side_effect=noop), \
+             patch.object(client, "_heartbeat", side_effect=noop):
+            async def run_connect():
+                await client.connect()
+                await client.close()
+
+            asyncio.run(run_connect())
+
+        self.assertEqual(dial_count, 2)
+        self.assertIn("https://muse.ai/api/hatch/vm/wake", http_calls)
+
+        # If InvalidStatus keeps failing across retries, include HTTP status code in error.
+        client_fail = HatchProtocolClient({"hatch_sess": "demo"})
+        client_fail._http = fake_http  # type: ignore[method-assign]
+
+        async def always_503(*a, **kw):
+            raise InvalidStatus(WSHTTPResponse(503, "Service Unavailable", Headers()))
+
+        client_fail._dial_noise_ws = always_503  # type: ignore[method-assign]
+        with patch("app.muse_engine.protocol_client.asyncio.sleep", AsyncMock()):
+            with self.assertRaises(MuseGenerationError) as ctx:
+                asyncio.run(client_fail.connect())
+        self.assertIn("InvalidStatus HTTP 503", str(ctx.exception))
+
+    def test_image_stream_skips_deviceless_replay_and_non_image_presentation(self):
+        import asyncio
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from app.muse_engine.config import EngineConfig
+        from app.muse_engine.protocol_engine import ProtocolEngine
+
+        class ReplayPollutedClient:
+            def __init__(self, *a, **kw):
+                self.node_id = "node-live-img"
+                self.timings = {}
+                self.responses = {1: SimpleNamespace(body=bytearray())}
+                self.downloaded: list[str] = []
+
+            def _mark(self, name):
+                self.timings[name] = 1.0
+
+            async def connect(self):
+                return None
+
+            async def subscribe(self):
+                return 1, {"status": "ok", "payload": {"capabilities": []}}
+
+            async def request(self, method, path, body, timeout):
+                evs = [
+                    # Device-less historical markdown index card (must be ignored!)
+                    {
+                        "event": "delta.presentation",
+                        "seq": 101,
+                        "payload": {
+                            "data": {
+                                "images": [
+                                    {
+                                        "path": "sandbox://workspace/wallpapers/index.md",
+                                        "mime": "text/markdown",
+                                    }
+                                ]
+                            }
+                        },
+                    },
+                    # Device-less onboarding tour / historical replay (must be ignored!)
+                    {
+                        "event": "delta.presentation",
+                        "seq": 102,
+                        "payload": {
+                            "chat_context": {"chat_id": "old"},
+                            "data": {
+                                "images": [
+                                    {
+                                        "path": "sandbox://workspace/imagine_media/stale_without_device.png",
+                                        "mime": "image/png",
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                    # Live generated image for this exact turn!
+                    {
+                        "event": "delta.presentation",
+                        "seq": 103,
+                        "payload": {
+                            "chat_context": {"device_id": self.node_id},
+                            "data": {
+                                "images": [
+                                    {
+                                        "path": "sandbox://workspace/imagine_media/real_apple.webp",
+                                        "mime": "image/webp",
+                                    }
+                                ]
+                            },
+                        },
+                    },
+                ]
+                self.responses[1].body.extend(
+                    "".join(json.dumps(e) + "\n" for e in evs).encode()
+                )
+                return SimpleNamespace(status=200, json=lambda: {"message_id": "u-img"})
+
+            async def wait_update(self, sub_id, timeout):
+                await asyncio.sleep(0.01)
+
+            async def download_bytes(self, resource):
+                self.downloaded.append(resource["path"])
+                return b"real-apple-webp"
+
+            async def close(self):
+                return None
+
+        fake = ReplayPollutedClient()
+        eng = ProtocolEngine(EngineConfig())
+
+        async def run():
+            out = []
+            async for ev in eng._stream(
+                {"hatch_sess": "h"},
+                "red apple",
+                expect="image",
+                timeout=10,
+                reference_images=None,
+                proxy=None,
+                use_pool=False,
+            ):
+                out.append(ev)
+            return out
+
+        with patch("app.muse_engine.protocol_engine.HatchProtocolClient", return_value=fake):
+            res = asyncio.run(run())
+        self.assertEqual(fake.downloaded, ["sandbox://workspace/imagine_media/real_apple.webp"])
+        self.assertEqual(res[-1]["data"], b"real-apple-webp")

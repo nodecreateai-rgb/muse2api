@@ -22,7 +22,7 @@ from urllib.parse import urlencode
 
 import requests
 import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 try:
     from websockets.protocol import State as _WSState
 except ImportError:  # pragma: no cover
@@ -307,16 +307,26 @@ class HatchProtocolClient:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Dest": "empty",
         }
-        try:
-            with request_proxy_context(self.proxy) as options:
-                # Prefer Session so warm TLS to muse.ai can be reused within this client.
-                response = self._http_session.request(
-                    method, url, headers=headers, json=body, timeout=30,
-                    allow_redirects=False, **options,
-                )
-        except requests.RequestException as exc:
-            error = MuseProxyError if self.proxy else MuseGenerationError
-            raise error(f"Muse HTTP request failed ({type(exc).__name__})") from None
+        response = None
+        for attempt in range(2):
+            try:
+                with request_proxy_context(self.proxy) as options:
+                    # Prefer Session so warm TLS to muse.ai can be reused within this client.
+                    response = self._http_session.request(
+                        method, url, headers=headers, json=body, timeout=30,
+                        allow_redirects=False, **options,
+                    )
+            except requests.RequestException as exc:
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                error = MuseProxyError if self.proxy else MuseGenerationError
+                raise error(f"Muse HTTP request failed ({type(exc).__name__})") from None
+            if response.status_code in (502, 503, 504) and attempt == 0:
+                time.sleep(0.6)
+                continue
+            break
+        assert response is not None
         if response.status_code == 401:
             raise MuseAuthError("Muse session authentication failed (HTTP 401)")
         if self.proxy and response.status_code == 407:
@@ -331,101 +341,53 @@ class HatchProtocolClient:
             raise MuseGenerationError("Muse returned an invalid protocol bootstrap response")
         return value
 
-    async def connect(self) -> None:
-        connectable_states = ("", "RUNNING", "UNKNOWN")
+    def _wake_vm_best_effort(self, vm_id: str, retry_count: int = 0) -> None:
+        if not vm_id:
+            return
+        try:
+            self._mark("wake_start")
+            self._http(
+                "POST",
+                "https://muse.ai/api/hatch/vm/wake",
+                {
+                    "vm_id": vm_id,
+                    "retry_count": retry_count,
+                    "connect_attempt_id": str(uuid.uuid4()),
+                },
+            )
+            self._mark("wake")
+        except MuseGenerationError:
+            pass
 
-        def _fetch_live_session() -> tuple[dict, str | None, str]:
-            self._mark("session_start")
+    def _fetch_live_session(self, connectable_states: tuple[str, ...]) -> dict:
+        self._mark("session_start")
+        sess = self._http("GET", "https://muse.ai/api/session?vm_state=live")
+        self._mark("session")
+        v_id = sess.get("vm_id")
+        v_state = str(sess.get("vm_state") or "").upper()
+        # Muse live session probes increasingly return vm_state="UNKNOWN" even for
+        # assigned standard VMs where /api/hatch/token + Noise WS connect directly.
+        if sess.get("status") != "assigned" or not sess.get("endpoint_url") or v_state not in connectable_states:
+            if not v_id:
+                raise MuseGenerationError("Muse workspace is not assigned")
+            self._wake_vm_best_effort(v_id, retry_count=0)
             sess = self._http("GET", "https://muse.ai/api/session?vm_state=live")
             self._mark("session")
-            v_id = sess.get("vm_id")
-            v_state = str(sess.get("vm_state") or "").upper()
-            # Muse live session probes increasingly return vm_state="UNKNOWN" even for
-            # assigned standard VMs where /api/hatch/token + Noise WS connect directly.
-            if sess.get("status") != "assigned" or not sess.get("endpoint_url") or v_state not in connectable_states:
-                if not v_id:
-                    raise MuseGenerationError("Muse workspace is not assigned")
-                # Wake is best-effort; readiness still requires a fresh session lookup.
-                try:
-                    self._mark("wake_start")
-                    self._http(
-                        "POST",
-                        "https://muse.ai/api/hatch/vm/wake",
-                        {
-                            "vm_id": v_id,
-                            "retry_count": 0,
-                            "connect_attempt_id": str(uuid.uuid4()),
-                        },
-                    )
-                    self._mark("wake")
-                except MuseGenerationError:
-                    pass
-                sess = self._http("GET", "https://muse.ai/api/session?vm_state=live")
-                self._mark("session")
-                v_id = sess.get("vm_id")
-                v_state = str(sess.get("vm_state") or "").upper()
-            return sess, v_id, v_state
+        return sess
 
-        cached = self._pop_remembered_session(self.cookies, self.proxy)
-        used_cached = False
-        if (
-            cached
-            and cached.get("status") == "assigned"
-            and cached.get("endpoint_url")
-            and str(cached.get("vm_state") or "").upper() in connectable_states
-        ):
-            session = cached
-            vm_id = session.get("vm_id")
-            vm_state = str(session.get("vm_state") or "").upper()
-            now_mark = time.perf_counter()
-            self.timings.setdefault("session_start", now_mark)
-            self.timings.setdefault("session", now_mark)
-            used_cached = True
-        else:
-            session, vm_id, vm_state = _fetch_live_session()
-
+    def _validate_hatch_session(
+        self, session: dict, connectable_states: tuple[str, ...]
+    ) -> tuple[str, str]:
         if session.get("status") != "assigned":
             raise MuseGenerationError("Muse workspace is not assigned")
+        vm_id = session.get("vm_id")
         endpoint = session.get("endpoint_url")
+        vm_state = str(session.get("vm_state") or "").upper()
         if not vm_id or not endpoint:
             raise MuseGenerationError("Muse session lacks VM connection information")
         if vm_state not in connectable_states:
             raise MuseGenerationError(f"Muse VM is not RUNNING (state={vm_state})")
         vm_type = str(session.get("vm_type") or "").lower()
-        self._mark("token_start")
-        try:
-            token = self._http(
-                "POST", "https://muse.ai/api/hatch/token",
-                {"vmAddress": endpoint, **({"vmName": session["vm_name"]} if session.get("vm_name") else {})},
-            )
-        except MuseGenerationError:
-            if not used_cached:
-                raise
-            # Cached session may have gone stale; re-fetch live session + wake once.
-            session, vm_id, vm_state = _fetch_live_session()
-            if session.get("status") != "assigned":
-                raise MuseGenerationError("Muse workspace is not assigned")
-            endpoint = session.get("endpoint_url")
-            if not vm_id or not endpoint:
-                raise MuseGenerationError("Muse session lacks VM connection information")
-            if vm_state not in connectable_states:
-                raise MuseGenerationError(f"Muse VM is not RUNNING (state={vm_state})")
-            vm_type = str(session.get("vm_type") or "").lower()
-            self._mark("token_start")
-            token = self._http(
-                "POST", "https://muse.ai/api/hatch/token",
-                {"vmAddress": endpoint, **({"vmName": session["vm_name"]} if session.get("vm_name") else {})},
-            )
-        auth_token = token.get("token")
-        self._mark("token")
-        if not auth_token:
-            raise MuseGenerationError("Muse hatch/token returned no token")
-        notary = token.get("notary_token")
-        if isinstance(notary, str) and notary.startswith("delegation."):
-            raise MuseGenerationError(
-                "Confidential-VM delegation endorsement is not implemented; "
-                "protocol engine supports standard hatch_vm only (no CDP fallback)"
-            )
         if "confidential" in vm_type:
             raise MuseGenerationError(
                 f"Unsupported VM type {session.get('vm_type')!r}; "
@@ -440,6 +402,29 @@ class HatchProtocolClient:
                         f"Unsupported confidential VM eligibility state={state!r}; "
                         "protocol engine supports standard hatch_vm only (no CDP fallback)"
                     )
+        return str(vm_id), str(endpoint)
+
+    def _fetch_hatch_token(self, session: dict, endpoint: str) -> tuple[str, str | None]:
+        self._mark("token_start")
+        token = self._http(
+            "POST", "https://muse.ai/api/hatch/token",
+            {"vmAddress": endpoint, **({"vmName": session["vm_name"]} if session.get("vm_name") else {})},
+        )
+        auth_token = token.get("token")
+        self._mark("token")
+        if not auth_token:
+            raise MuseGenerationError("Muse hatch/token returned no token")
+        notary = token.get("notary_token")
+        if isinstance(notary, str) and notary.startswith("delegation."):
+            raise MuseGenerationError(
+                "Confidential-VM delegation endorsement is not implemented; "
+                "protocol engine supports standard hatch_vm only (no CDP fallback)"
+            )
+        return str(auth_token), (str(notary) if notary else None)
+
+    async def _dial_noise_ws(
+        self, session: dict, vm_id: str, auth_token: str, notary: str | None
+    ) -> None:
         query = {
             "vm_id": vm_id, "auth_token": auth_token, "app_id": "hatch-web",
             "request_id": str(uuid.uuid4()),
@@ -483,7 +468,7 @@ class HatchProtocolClient:
             await self.ws.send(noise.msg3())  # empty payload for standard VM
             self.send_cipher, self.recv_cipher = noise.split()
             self._mark("noise")
-        except (MuseAuthError, MuseProxyError, MuseGenerationError):
+        except Exception:
             if self.ws is not None:
                 try:
                     await self.ws.close()
@@ -494,18 +479,60 @@ class HatchProtocolClient:
                 self.relay.close()
                 self.relay = None
             raise
-        except Exception as exc:
-            if self.ws is not None:
-                try:
-                    await self.ws.close()
-                except Exception:
-                    pass
-                self.ws = None
-            if self.relay:
-                self.relay.close()
-                self.relay = None
-            error = MuseProxyError if self.proxy else MuseGenerationError
-            raise error(f"Noise WebSocket connection failed ({type(exc).__name__})") from None
+
+    async def connect(self) -> None:
+        connectable_states = ("", "RUNNING", "UNKNOWN")
+        cached = self._pop_remembered_session(self.cookies, self.proxy)
+        used_cached = False
+        if (
+            cached
+            and cached.get("status") == "assigned"
+            and cached.get("endpoint_url")
+            and str(cached.get("vm_state") or "").upper() in connectable_states
+        ):
+            session = cached
+            now_mark = time.perf_counter()
+            self.timings.setdefault("session_start", now_mark)
+            self.timings.setdefault("session", now_mark)
+            used_cached = True
+        else:
+            session = self._fetch_live_session(connectable_states)
+
+        vm_id, endpoint = self._validate_hatch_session(session, connectable_states)
+        try:
+            auth_token, notary = self._fetch_hatch_token(session, endpoint)
+        except MuseGenerationError:
+            if not used_cached:
+                raise
+            # Cached session may have gone stale; re-fetch live session + wake once.
+            session = self._fetch_live_session(connectable_states)
+            vm_id, endpoint = self._validate_hatch_session(session, connectable_states)
+            auth_token, notary = self._fetch_hatch_token(session, endpoint)
+
+        for ws_attempt in range(3):
+            try:
+                await self._dial_noise_ws(session, vm_id, auth_token, notary)
+                break
+            except (MuseAuthError, MuseProxyError, MuseGenerationError):
+                raise
+            except Exception as exc:
+                # Idle/sleeping VMs often return vm_state="UNKNOWN" and reject WS with InvalidStatus
+                # (e.g. 502/503/404) until /api/hatch/vm/wake is issued and ingress boots.
+                transient_ws = isinstance(exc, (InvalidStatus, ConnectionClosed, ConnectionError, asyncio.TimeoutError, OSError))
+                if ws_attempt < 2 and transient_ws:
+                    self._wake_vm_best_effort(vm_id, retry_count=ws_attempt + 1)
+                    await asyncio.sleep(1.5 if ws_attempt == 0 else 2.5)
+                    session = self._fetch_live_session(connectable_states)
+                    vm_id, endpoint = self._validate_hatch_session(session, connectable_states)
+                    auth_token, notary = self._fetch_hatch_token(session, endpoint)
+                    continue
+                error = MuseProxyError if self.proxy else MuseGenerationError
+                if isinstance(exc, InvalidStatus):
+                    sc = getattr(getattr(exc, "response", None), "status_code", None)
+                    detail = f"InvalidStatus HTTP {sc}" if sc is not None else "InvalidStatus"
+                else:
+                    detail = type(exc).__name__
+                raise error(f"Noise WebSocket connection failed ({detail})") from None
         self.closing = False
         self._closed_error = None
         self.receiver_task = asyncio.create_task(self._receiver())

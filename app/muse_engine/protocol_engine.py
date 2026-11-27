@@ -128,7 +128,7 @@ def _normalize_media_path(path: str) -> tuple[str, str] | None:
         uri = "sandbox://" + path
     else:
         return None
-    if remote.startswith("workspace/user/"):
+    if remote.startswith(("workspace/user/", "workspace/onboarding_tour/")):
         return None
     return uri, remote
 
@@ -181,12 +181,22 @@ def _media_candidates(value: Any, output: list[dict]) -> None:
             _media_candidates(child, output)
 
 
+_IMAGE_SUFFIXES = frozenset(
+    {".png", ".webp", ".jpg", ".jpeg", ".gif", ".bmp", ".avif", ".tif", ".tiff"}
+)
+_VIDEO_SUFFIXES = frozenset({".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"})
+
+
 def _resource_kind(resource: dict) -> str:
-    mime = str(resource.get("mime") or resource.get("mime_type") or "").lower()
+    mime = str(resource.get("mime") or resource.get("mime_type") or "").lower().split(";", 1)[0].strip()
     if mime.startswith("video/"):
         return "video"
-    if mime.startswith("image/"):
+    if mime.startswith("image/") and mime != "image/svg+xml":
         return "image"
+    if mime and mime != "application/octet-stream":
+        # Non-media MIMEs (e.g. text/markdown, text/html, application/json) must not be
+        # misclassified as images and passed into Pillow/PNG conversion.
+        return "other"
     path = str(
         resource.get("path")
         or resource.get("uri")
@@ -195,7 +205,11 @@ def _resource_kind(resource: dict) -> str:
         or ""
     )
     suffix = Path(path).suffix.lower()
-    return "video" if suffix in (".mp4", ".webm", ".mov") else "image"
+    if suffix in _VIDEO_SUFFIXES:
+        return "video"
+    if suffix in _IMAGE_SUFFIXES:
+        return "image"
+    return "other"
 
 
 def _payload_device_id(payload: dict) -> str | None:
@@ -589,19 +603,29 @@ class ProtocolEngine:
                             "delta.tool_done",
                             "delta.placeholder",
                         ):
-                            before = len(candidates)
-                            _scoped_media_candidates(
-                                name,
-                                payload,
-                                node_id=node_id,
-                                marker=marker,
-                                output=candidates,
+                            allow_media = ours or (
+                                name == "delta.message_done"
+                                and expect is not None
+                                and (presentation_ready or bool(candidates))
                             )
-                            if name == "delta.presentation" and len(candidates) > before:
-                                presentation_ready = True
-                                if "first_event" not in client.timings:
-                                    client._mark("first_event")
-                                    note("first_event", node_id=node_id, kind="presentation")
+                            if allow_media:
+                                before = len(candidates)
+                                _scoped_media_candidates(
+                                    name,
+                                    payload,
+                                    node_id=node_id,
+                                    marker=marker,
+                                    output=candidates,
+                                )
+                                if name == "delta.presentation" and len(candidates) > before:
+                                    if expect is None or any(
+                                        _resource_kind(c["resource"]) == expect
+                                        for c in candidates[before:]
+                                    ):
+                                        presentation_ready = True
+                                        if "first_event" not in client.timings:
+                                            client._mark("first_event")
+                                            note("first_event", node_id=node_id, kind="presentation")
                         if name == "delta.message_done":
                             status = payload.get("status")
                             if ours and status not in (None, "completed"):
